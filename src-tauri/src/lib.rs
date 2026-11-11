@@ -410,15 +410,25 @@ fn schedule_auto_check(app: tauri::AppHandle) {
 }
 
 fn open_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.show();
-        let _ = window.set_focus();
-    } else if let Some(config) = app.config().app.windows.first() {
-        // The WebView is destroyed while the window is closed (tray-only), so recreate it on demand.
-        if let Ok(builder) = tauri::WebviewWindowBuilder::from_config(app, config) {
-            let _ = builder.build();
+    // Window creation must happen on the main thread (this is also called from the single-instance thread).
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window("main") {
+            if window.show().is_ok() {
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+                return;
+            }
         }
-    }
+        // The WebView is destroyed while the window is closed (tray-only), so recreate it on demand.
+        if let Some(config) = handle.config().app.windows.first() {
+            match tauri::WebviewWindowBuilder::from_config(&handle, config).and_then(|b| b.build())
+            {
+                Ok(_) => {}
+                Err(error) => eprintln!("Cannot reopen window: {error}"),
+            }
+        }
+    });
 }
 
 pub fn run() {
