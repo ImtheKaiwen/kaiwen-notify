@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- **English / Turkish i18n**: dictionaries in `src/locales`, language follows the Windows display language, manual override in Settings, applied instantly and persisted. Backend errors are now stable codes translated in the UI; tray menu is localized too. Parity and placeholder tests.
+- **Launch at startup** (official `tauri-plugin-autostart`, off by default, tray-only with no window or splash, state read from the OS, registry entry removed by the uninstaller).
+- **Transparent animated splash** (Antigravity, Codex/OpenAI, Claude logos, then the app icon and wordmark; opacity/transform only; reduced-motion aware; hard 5 s cap). Skipped for startup launches, tray reopen, second launches and the restart after an update. The main window is created hidden and revealed once rendered.
+- **Background update checks every 10 minutes** from a Rust thread (condvar sleep, 20 s timeout, exponential backoff while offline, no repeated error spam, no requests when the updater is unconfigured, one check at a time). New versions show in the tray menu/tooltip and the Updates card; nothing downloads or installs automatically.
+- Provider state `repair_required`; Antigravity also detected through its per-user program folder.
+- MIT `LICENSE`, `THIRD_PARTY_NOTICES.md`, `docs/PERFORMANCE.md`.
+- Sandbox tests with Turkish-letter/space profile paths and single-provider machines.
+
+### Changed
+- Default notification sound replaced by an original synthesized chime (`scripts/make-default-sound.py`); the previous sound's origin was undocumented.
+- The notification listener binds before any window is created, so the UI never shows a false "listener down".
+- CI actions updated to current majors (Node 24 runtime).
+
 ## 0.4.0
 
 ### Antigravity (unreleased fixes in this version)

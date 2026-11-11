@@ -23,10 +23,13 @@ FOREIGN_CODEX = {'hooks': {'Stop': [{'hooks': [{'type': 'command', 'command': 'e
 FOREIGN_ANTI = {'someone-else': {'enabled': True, 'Stop': [{'type': 'command', 'command': 'echo anti'}]}}
 
 
-@pytest.fixture()
-def profile():
-    base = Path(tempfile.mkdtemp(prefix='kn-test-'))
-    home, local = base / 'home', base / 'local'
+PROFILE_NAMES = ['plain', 'Çağrı Ünal şğı (test)']  # second: Turkish letters, spaces, parentheses
+
+
+@pytest.fixture(params=PROFILE_NAMES, ids=['ascii', 'turkish-with-spaces'])
+def profile(request):
+    base = Path(tempfile.mkdtemp(prefix='kn-test-')) / request.param
+    home, local = base / 'home dir', base / 'local app'
     (home / '.claude').mkdir(parents=True)
     (home / '.codex').mkdir()
     (home / '.gemini' / 'config').mkdir(parents=True)
@@ -36,7 +39,7 @@ def profile():
     (home / '.gemini' / 'config' / 'hooks.json').write_text(json.dumps(FOREIGN_ANTI), 'utf8')
     (home / '.codex' / 'config.toml').write_bytes(TOML.encode('utf8'))
     yield home, local
-    shutil.rmtree(base, ignore_errors=True)
+    shutil.rmtree(base.parent, ignore_errors=True)
 
 
 def run(script, home, local, *args):
@@ -44,7 +47,7 @@ def run(script, home, local, *args):
     result = subprocess.run(
         ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
          str(SCRIPTS / script), *args],
-        env=env, capture_output=True, text=True, timeout=120)
+        env=env, capture_output=True, text=True, encoding='utf8', errors='replace', timeout=120)
     assert result.returncode == 0, result.stderr
     return result
 
@@ -107,7 +110,7 @@ def test_corrupt_config_is_not_overwritten(profile):
         ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
          str(SCRIPTS / 'install-hooks.ps1'), '-Provider', 'claude'],
         env=dict(os.environ, USERPROFILE=str(home), LOCALAPPDATA=str(local)),
-        capture_output=True, text=True, timeout=120)
+        capture_output=True, text=True, encoding='utf8', errors='replace', timeout=120)
     assert result.returncode != 0
     assert bad.read_text('utf8') == '{ not json'
 
@@ -180,7 +183,7 @@ def invoke_bridge(source, payload, port_holder):
         result = subprocess.run(
             ['powershell.exe', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
              str(BRIDGE), '-Source', source],
-            input=payload, capture_output=True, text=True, timeout=60)
+            input=payload, capture_output=True, text=True, encoding='utf8', errors='replace', timeout=60)
         t.join(timeout=3)
     finally:
         sock.close()
@@ -210,3 +213,34 @@ def test_antigravity_garbage_or_empty_stdin_still_returns_valid_json():
         got, result = invoke_bridge('antigravity', payload, None)
         assert result.returncode == 0
         assert json.loads(result.stdout.strip()) == {'decision': 'stop'}
+
+
+def test_installed_hook_commands_run_from_unusual_paths(profile):
+    """The exact command stored in each config must execute when the path has spaces/Turkish letters."""
+    home, local = profile
+    run('install-hooks.ps1', home, local)
+    cfg_cmds = {
+        'claude': load(home, '.claude', 'settings.json')['hooks']['Stop'][-1]['hooks'][0]['command'],
+        'codex': load(home, '.codex', 'hooks.json')['hooks']['Stop'][-1]['hooks'][0]['command'],
+        'antigravity': anti_cmd(home, local),
+    }
+    for source, cmd in cfg_cmds.items():
+        payload = json.dumps({'terminationReason': 'model_stop', 'fullyIdle': True})
+        env = dict(os.environ, USERPROFILE=str(home), LOCALAPPDATA=str(local))
+        result = subprocess.run(cmd, shell=True, input=payload, capture_output=True, text=True, encoding='utf8', errors='replace',
+                                timeout=60, env=env)
+        assert result.returncode == 0, (source, result.stderr)
+        expected = {'claude': '', 'codex': '{}', 'antigravity': '{"decision":"stop"}'}[source]
+        assert result.stdout.strip() == expected, (source, result.stdout)
+
+
+def test_only_detected_provider_missing_tools_do_not_break_install(profile):
+    """A machine with just one tool installed: scripts for the others must not fail or create junk."""
+    home, local = profile
+    shutil.rmtree(home / '.codex')
+    shutil.rmtree(home / '.gemini')
+    run('install-hooks.ps1', home, local, '-Provider', 'claude')
+    assert count_ours((home / '.claude' / 'settings.json').read_text('utf8')) == 1
+    assert not (home / '.codex').exists() and not (home / '.gemini').exists()
+    run('uninstall-hooks.ps1', home, local)  # nothing to remove elsewhere: still succeeds
+    assert count_ours((home / '.claude' / 'settings.json').read_text('utf8')) == 0

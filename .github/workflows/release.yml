@@ -25,8 +25,8 @@ jobs:
           if (-not $env:TAURI_SIGNING_PRIVATE_KEY) { $missing += 'secret TAURI_SIGNING_PRIVATE_KEY' }
           if (-not $env:UPDATER_PUBKEY) { $missing += 'variable UPDATER_PUBKEY' }
           if ($missing) { throw "Release blocked. Missing: $($missing -join ', '). See docs/RELEASING.md." }
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -34,7 +34,7 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - run: pip install pytest pillow
