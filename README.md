@@ -27,6 +27,8 @@ Works with **Claude Code**, **Codex** (CLI and Desktop) and **Antigravity**. Bui
 | Codex CLI / Desktop | independent `Stop` hook | `~/.codex/hooks.json` (its TOML config and `notify` setting are never touched) |
 | Antigravity | named `Stop` hook group | `~/.gemini/config/hooks.json` |
 
+Antigravity's Desktop App, IDE and CLI share the one global hooks file but are separate runtimes. The **Integrations** card shows per runtime whether the hook has *really run* (a hook file alone is not counted as success); restart Antigravity fully after installing, because the docs do not say whether it hot-reloads hooks.
+
 Each provider is detected independently (**Not detected / Detected / Connected / Repair required / Permission required / Failed / Unsupported**). A tool that is not installed is skipped and never breaks the others. Existing hooks are preserved. Agents may need a restart to load new hooks. Codex asks you to trust a new hook (`/hooks` in the CLI, Settings > Hooks in Desktop).
 
 ## Install

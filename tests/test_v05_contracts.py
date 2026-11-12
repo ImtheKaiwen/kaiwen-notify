@@ -206,3 +206,25 @@ def test_license_and_notices():
     notices = read('THIRD_PARTY_NOTICES.md')
     for word in ('Anthropic', 'OpenAI', 'Google', 'trademark', 'default.wav'):
         assert word in notices
+
+
+def test_release_workflow_shape():
+    wf = read('.github/workflows/release.yml')
+    assert 'tauri-apps/tauri-action@v1' in wf and 'uploadUpdaterJson: true' in wf
+    assert 'includeUpdaterJson' not in wf  # v0-only input
+    assert 'releaseDraft: true' in wf, 'always built as a draft first'
+    assert wf.index('verify-assets') < wf.index('--draft=false'), 'publish only after asset verification'
+    assert 'verify-endpoint' in wf and 'check-versions' in wf
+    assert 'TAURI_SIGNING_PRIVATE_KEY' in wf and 'UPDATER_PUBKEY' in wf
+    assert 'secrets.GITHUB_TOKEN' in wf
+    tools = read('scripts/release_tools.py')
+    for word in ('latest.json', 'signature', 'windows-x86_64', 'releases/download'):
+        assert word in tools
+
+
+def test_release_tools_check_versions_matches_repo():
+    import subprocess, sys
+    version = json.loads(read('package.json'))['version']
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/release_tools.py'), 'check-versions', version],
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr

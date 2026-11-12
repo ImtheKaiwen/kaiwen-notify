@@ -11,6 +11,10 @@
 - MIT `LICENSE`, `THIRD_PARTY_NOTICES.md`, `docs/PERFORMANCE.md`.
 - Sandbox tests with Turkish-letter/space profile paths and single-provider machines.
 
+### Antigravity
+- The bridge now tells the Desktop App, IDE and CLI apart (they share `~/.gemini/config/hooks.json` but keep separate data folders) and also reports silent runs. The app shows per-runtime evidence in the Integrations card; a hook file alone is no longer presented as a working connection.
+- Known gap: a real end-to-end notification from the Antigravity Desktop App is **not verified yet** (the CLI quota was exhausted during testing and the Desktop UI could not be driven). Antigravity probably has to be fully restarted after hooks change; the docs do not say whether it hot-reloads them.
+
 ### Changed
 - Default notification sound replaced by an original synthesized chime (`scripts/make-default-sound.py`); the previous sound's origin was undocumented.
 - The notification listener binds before any window is created, so the UI never shows a false "listener down".
