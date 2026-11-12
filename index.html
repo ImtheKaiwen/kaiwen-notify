@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="tr">
+<html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -15,56 +15,65 @@
     </header>
 
     <section id="setup-view" class="view" hidden aria-labelledby="setup-title">
-      <h1 id="setup-title">Görev bittiğinde haberin olsun.</h1>
-      <p class="lead">Claude Code, Codex ve Antigravity'yi bağla; görev tamamlandığında bir ses çalalım.</p>
+      <h1 id="setup-title" data-i18n="onboarding.title"></h1>
+      <p class="lead" data-i18n="onboarding.lead"></p>
       <ul class="providers" id="setup-providers"></ul>
-      <button class="btn btn-primary btn-wide" id="install-integrations" disabled type="button"><span class="btn-label">Entegrasyonları Kur</span></button>
-      <p id="setup-feedback" class="note" role="status">Mevcut ayarlar kontrol ediliyor…</p>
-      <p class="note">Mevcut hook'ların ve Codex <code>notify</code> ayarın korunur. Değiştirilen dosyalar yedeklenir.</p>
+      <button class="btn btn-primary btn-wide" id="install-integrations" disabled type="button"><span class="btn-label" data-i18n="onboarding.install"></span></button>
+      <p id="setup-feedback" class="note" role="status"></p>
+      <p class="note" data-i18n="onboarding.note"></p>
     </section>
 
     <div id="dashboard-view" class="view" hidden>
       <section class="card status" aria-live="polite">
-        <div class="status-line"><span id="status-dot" class="dot"></span><span id="status-label">Kontrol ediliyor</span></div>
-        <span class="muted tabular" id="event-count">0 bildirim</span>
+        <div class="status-line"><span id="status-dot" class="dot"></span><span id="status-label"></span></div>
+        <span class="muted tabular" id="event-count"></span>
       </section>
 
       <section class="card">
-        <h2>Entegrasyonlar</h2>
+        <h2 data-i18n="integrations.title"></h2>
         <ul class="providers" id="dash-providers"></ul>
         <p id="integration-message" class="note" role="status"></p>
+        <div id="antigravity-diag" class="diag" hidden></div>
       </section>
 
       <section class="card">
-        <h2>Bildirim sesi</h2>
+        <h2 data-i18n="sound.title"></h2>
         <div class="row">
-          <div class="grow"><div id="sound-name" class="strong ellipsis">Kaiwen Default</div><div id="sound-info" class="muted small">Yerleşik kısa bildirim sesi</div></div>
-          <button id="pick-sound" class="btn" type="button">Değiştir</button>
+          <div class="grow"><div id="sound-name" class="strong ellipsis"></div><div id="sound-info" class="muted small"></div></div>
+          <button id="pick-sound" class="btn" type="button" data-i18n="sound.change"></button>
         </div>
         <div class="actions">
-          <button id="test-sound" class="btn btn-primary" type="button"><span class="btn-label">Bildirimi test et</span></button>
-          <button id="reset-sound" class="btn btn-quiet" type="button">Varsayılana dön</button>
+          <button id="test-sound" class="btn btn-primary" type="button"><span class="btn-label" data-i18n="sound.test"></span></button>
+          <button id="reset-sound" class="btn btn-quiet" type="button" data-i18n="sound.reset"></button>
         </div>
       </section>
 
       <section class="card">
-        <h2>Ayarlar</h2>
-        <label class="row setting"><span class="grow"><span class="strong">Bildirimleri etkinleştir</span><span class="muted small block">Görev bitişlerini sesle bildir</span></span><span class="switch"><input id="enabled" type="checkbox" checked /><span class="track"></span></span></label>
-        <label class="row setting"><span class="grow"><span class="strong">Güncellemeleri otomatik kontrol et</span><span class="muted small block">Başlangıçta, en fazla 12 saatte bir</span></span><span class="switch"><input id="auto-update" type="checkbox" checked /><span class="track"></span></span></label>
-        <div class="row setting"><span class="grow strong">Tema</span>
-          <div class="segmented" role="radiogroup" aria-label="Tema">
-            <button type="button" data-theme-choice="system" role="radio">Sistem</button>
-            <button type="button" data-theme-choice="light" role="radio">Açık</button>
-            <button type="button" data-theme-choice="dark" role="radio">Koyu</button>
+        <h2 data-i18n="settings.title"></h2>
+        <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.enable"></span><span class="muted small block" data-i18n="settings.enableDesc"></span></span><span class="switch"><input id="enabled" type="checkbox" checked /><span class="track"></span></span></label>
+        <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.autoUpdate"></span><span class="muted small block" id="auto-update-desc"></span></span><span class="switch"><input id="auto-update" type="checkbox" checked /><span class="track"></span></span></label>
+        <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.autostart"></span><span class="muted small block" data-i18n="settings.autostartDesc"></span></span><span class="switch"><input id="autostart" type="checkbox" /><span class="track"></span></span></label>
+        <div class="row setting"><span class="grow strong" data-i18n="settings.theme"></span>
+          <div class="segmented" role="radiogroup" data-i18n-aria="settings.theme">
+            <button type="button" data-theme-choice="system" role="radio" data-i18n="settings.theme.system"></button>
+            <button type="button" data-theme-choice="light" role="radio" data-i18n="settings.theme.light"></button>
+            <button type="button" data-theme-choice="dark" role="radio" data-i18n="settings.theme.dark"></button>
+          </div>
+        </div>
+        <div class="row setting"><span class="grow strong" data-i18n="settings.language"></span>
+          <div class="segmented" role="radiogroup" data-i18n-aria="settings.language" id="language-choices">
+            <button type="button" data-language-choice="system" role="radio" data-i18n="settings.language.system"></button>
+            <button type="button" data-language-choice="en" role="radio">English</button>
+            <button type="button" data-language-choice="tr" role="radio">Türkçe</button>
           </div>
         </div>
       </section>
 
       <section class="card" id="update-card">
-        <h2>Güncellemeler</h2>
+        <h2 data-i18n="update.title"></h2>
         <div class="row">
-          <div class="grow"><div id="update-title" class="strong">Güncelleme durumu bilinmiyor</div><div id="update-sub" class="muted small"></div></div>
-          <button id="update-action" class="btn" type="button"><span class="btn-label">Güncellemeleri Kontrol Et</span></button>
+          <div class="grow"><div id="update-title" class="strong"></div><div id="update-sub" class="muted small"></div></div>
+          <button id="update-action" class="btn" type="button"><span class="btn-label"></span></button>
         </div>
         <div id="update-progress" class="progress" hidden><div class="bar" id="update-bar"></div></div>
         <div id="update-bytes" class="muted small tabular" hidden></div>
@@ -72,20 +81,20 @@
       </section>
 
       <section class="card">
-        <h2>Entegrasyon yönetimi</h2>
+        <h2 data-i18n="manage.title"></h2>
         <div class="actions">
-          <button id="reinstall-integrations" class="btn" type="button"><span class="btn-label">Eksikleri kur / Onar</span></button>
-          <button id="uninstall-integrations" class="btn btn-danger" type="button"><span class="btn-label">Entegrasyonları Kaldır</span></button>
+          <button id="reinstall-integrations" class="btn" type="button"><span class="btn-label" data-i18n="manage.repair"></span></button>
+          <button id="uninstall-integrations" class="btn btn-danger" type="button"><span class="btn-label" data-i18n="manage.uninstall"></span></button>
         </div>
       </section>
-      <footer><span id="last-event">Henüz görev bildirimi alınmadı.</span><span>Pencereyi kapatınca tray'de kalır.</span></footer>
+      <footer><span id="last-event"></span><span data-i18n="footer.tray"></span></footer>
     </div>
 
     <dialog id="confirm-dialog" aria-labelledby="confirm-title">
       <form method="dialog">
-        <h2 id="confirm-title">Entegrasyonlar kaldırılsın mı?</h2>
-        <p class="muted">Yalnızca Kaiwen Notify'ın eklediği hook'lar silinir. Diğer hook'ların ve Codex <code>notify</code> ayarın korunur. Dosyalar önce yedeklenir.</p>
-        <div class="actions end"><button value="cancel" class="btn">Vazgeç</button><button value="confirm" class="btn btn-danger" id="confirm-yes">Kaldır</button></div>
+        <h2 id="confirm-title" data-i18n="dialog.uninstallTitle"></h2>
+        <p class="muted" data-i18n="dialog.uninstallBody"></p>
+        <div class="actions end"><button value="cancel" class="btn" data-i18n="dialog.cancel"></button><button value="confirm" class="btn btn-danger" id="confirm-yes" data-i18n="dialog.remove"></button></div>
       </form>
     </dialog>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>

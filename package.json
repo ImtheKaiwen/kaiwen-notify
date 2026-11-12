@@ -1,7 +1,7 @@
 {
   "name": "kaiwen-notify",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -19,5 +19,6 @@
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
     "@tauri-apps/plugin-updater": "^2.14.1"
-  }
+  },
+  "license": "MIT"
 }

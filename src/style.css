@@ -63,6 +63,11 @@ h2{font-size:13px;margin:0 0 var(--s3);font-weight:600}
 @keyframes slide{0%{margin-left:-35%}100%{margin-left:100%}}
 #update-bytes{margin-top:var(--s2);min-height:18px}
 .notes{margin:var(--s3) 0 0;padding:var(--s3);background:var(--soft);border-radius:8px;font:12px/1.5 inherit;white-space:pre-wrap;max-height:140px;overflow:auto}
+.diag{margin-top:var(--s3);border-top:1px solid var(--line);padding-top:var(--s3)}
+.diag h3{font-size:12px;margin:0 0 var(--s2);font-weight:600}
+.diag-row{display:flex;gap:var(--s3);font-size:12px;padding:3px 0}
+.diag-row .who{width:96px;flex-shrink:0;font-weight:600}
+.diag-row .what{color:var(--muted)}.diag-row .what.ok{color:var(--text)}
 footer{display:flex;justify-content:space-between;gap:var(--s3);color:var(--muted);font-size:11px;padding-top:var(--s3)}
 dialog{border:1px solid var(--line);border-radius:12px;background:var(--bg);color:var(--text);max-width:420px;padding:var(--s5)}
 dialog::backdrop{background:rgba(0,0,0,.4)}dialog h2{font-size:15px}dialog p{margin:0}

@@ -19,6 +19,7 @@ pub enum ProviderState {
     NotInstalled,
     Available,
     Connected,
+    RepairRequired,
     PermissionRequired,
     Failed,
     Unsupported,
@@ -49,6 +50,22 @@ impl Provider {
             Self::Antigravity => ".gemini",
         })
     }
+    /// True when the tool looks installed: its own config directory exists, or (Antigravity, whose
+    /// config dir only appears after the first run) a per-user program folder exists.
+    fn is_present(self, home: &Path) -> bool {
+        if self.tool_dir(home).is_dir() {
+            return true;
+        }
+        if self == Self::Antigravity {
+            if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+                let programs = PathBuf::from(local).join("Programs");
+                return ["Antigravity", "Antigravity IDE"]
+                    .iter()
+                    .any(|name| programs.join(name).is_dir());
+            }
+        }
+        false
+    }
     fn config_file(self, home: &Path) -> PathBuf {
         match self {
             Self::Claude => home.join(".claude").join("settings.json"),
@@ -76,7 +93,7 @@ pub struct Progress {
 }
 
 pub fn expected_hook_path() -> Result<PathBuf, String> {
-    let local = std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA bulunamadı")?;
+    let local = std::env::var_os("LOCALAPPDATA").ok_or("E_NO_LOCALAPPDATA")?;
     Ok(PathBuf::from(local)
         .join("KaiwenNotify")
         .join("hooks")
@@ -85,7 +102,7 @@ pub fn expected_hook_path() -> Result<PathBuf, String> {
 
 pub fn home_dir() -> Result<PathBuf, String> {
     Ok(PathBuf::from(
-        std::env::var_os("USERPROFILE").ok_or("USERPROFILE bulunamadı")?,
+        std::env::var_os("USERPROFILE").ok_or("E_NO_USERPROFILE")?,
     ))
 }
 
@@ -165,33 +182,27 @@ pub fn detect_one(provider: Provider) -> Result<ProviderReport, String> {
         detail: detail.map(str::to_owned),
     };
     if !cfg!(windows) {
-        return Ok(report(
-            ProviderState::Unsupported,
-            Some("Yalnızca Windows destekleniyor"),
-        ));
+        return Ok(report(ProviderState::Unsupported, Some("unsupported_os")));
     }
     let home = home_dir()?;
     let script = expected_hook_path()?;
     if needs_migration(provider) {
         return Ok(report(
-            ProviderState::Available,
-            Some("Hook komutu güncellenmeli (Onar)"),
+            ProviderState::RepairRequired,
+            Some("repair_required"),
         ));
     }
     if is_connected(provider, &home, &script) {
         return Ok(report(ProviderState::Connected, None));
     }
-    if !provider.tool_dir(&home).is_dir() {
-        return Ok(report(
-            ProviderState::NotInstalled,
-            Some("Araç bu bilgisayarda bulunamadı"),
-        ));
+    if !provider.is_present(&home) {
+        return Ok(report(ProviderState::NotInstalled, Some("not_detected")));
     }
     let config = provider.config_file(&home);
     if fs::metadata(&config).is_ok_and(|m| m.permissions().readonly()) {
         return Ok(report(
             ProviderState::PermissionRequired,
-            Some("Yapılandırma dosyası salt okunur"),
+            Some("readonly_config"),
         ));
     }
     Ok(report(ProviderState::Available, None))
@@ -223,7 +234,7 @@ fn run_script(scripts_dir: &Path, install: bool, provider: Provider) -> Result<(
         .args(["-Provider", provider.id()])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|e| format!("PowerShell çalıştırılamadı: {e}"))?;
+        .map_err(|e| format!("E_POWERSHELL:{e}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -239,7 +250,7 @@ fn run_script(scripts_dir: &Path, install: bool, provider: Provider) -> Result<(
 
 #[cfg(not(windows))]
 fn run_script(_: &Path, _: bool, _: Provider) -> Result<(), String> {
-    Err("Hook kurulumu yalnızca Windows üzerinde destekleniyor".into())
+    Err("E_UNSUPPORTED_OS".into())
 }
 
 #[cfg(windows)]
@@ -260,7 +271,7 @@ fn write_scripts(dir: &Path) -> Result<(), String> {
 
 #[cfg(not(windows))]
 fn write_scripts(_: &Path) -> Result<(), String> {
-    Err("Hook kurulumu yalnızca Windows üzerinde destekleniyor".into())
+    Err("E_UNSUPPORTED_OS".into())
 }
 
 /// RAII guard so only one install/uninstall runs at a time.
@@ -269,7 +280,7 @@ impl<'a> BusyGuard<'a> {
     pub fn acquire(flag: &'a AtomicBool) -> Result<Self, String> {
         flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| Self(flag))
-            .map_err(|_| "Başka bir entegrasyon işlemi sürüyor".to_string())
+            .map_err(|_| "E_BUSY".to_string())
     }
 }
 impl Drop for BusyGuard<'_> {
@@ -308,7 +319,7 @@ pub fn run_operation(
     let before = detect_all()?;
     for report in &before {
         let provider = ALL.iter().copied().find(|p| p.id() == report.id).unwrap();
-        emit(app, operation, provider, "waiting", report.state, "Sırada");
+        emit(app, operation, provider, "waiting", report.state, "waiting");
     }
     let mut failed: Vec<(&'static str, String)> = Vec::new();
     for provider in ALL {
@@ -316,16 +327,21 @@ pub fn run_operation(
         let actionable = if install {
             matches!(
                 current.state,
-                ProviderState::Available | ProviderState::PermissionRequired
-            ) || needs_migration(provider)
+                ProviderState::Available
+                    | ProviderState::PermissionRequired
+                    | ProviderState::RepairRequired
+            )
         } else {
-            current.state == ProviderState::Connected || needs_migration(provider)
+            matches!(
+                current.state,
+                ProviderState::Connected | ProviderState::RepairRequired
+            )
         };
         if !actionable {
             let note = match current.state {
-                ProviderState::Connected => "Zaten bağlı",
-                ProviderState::NotInstalled => "Atlandı: araç bulunamadı",
-                _ => "Atlandı",
+                ProviderState::Connected => "already_connected",
+                ProviderState::NotInstalled => "skipped_not_detected",
+                _ => "skipped",
             };
             emit(app, operation, provider, "skipped", current.state, note);
             continue;
@@ -337,9 +353,9 @@ pub fn run_operation(
             "working",
             current.state,
             if install {
-                "Hook ekleniyor…"
+                "installing"
             } else {
-                "Hook kaldırılıyor…"
+                "uninstalling"
             },
         );
         let outcome = run_script(scripts_dir, install, provider);
@@ -357,16 +373,10 @@ pub fn run_operation(
                 provider,
                 "done",
                 after.state,
-                if install {
-                    "Bağlandı"
-                } else {
-                    "Kaldırıldı"
-                },
+                if install { "connected" } else { "removed" },
             ),
             (outcome, _) => {
-                let message = outcome
-                    .err()
-                    .unwrap_or_else(|| "Değişiklik doğrulanamadı".into());
+                let message = outcome.err().unwrap_or_else(|| "E_VERIFY".into());
                 emit(
                     app,
                     operation,

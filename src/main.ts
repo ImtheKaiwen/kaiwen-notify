@@ -2,34 +2,31 @@ import './style.css';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { open } from '@tauri-apps/plugin-dialog';
+import { errorText, onLanguageChange, resolveLanguage, setLanguage, t, language } from './i18n';
+import type { Key } from './locales/en';
 
 type Theme = 'system' | 'light' | 'dark';
-type Settings = { enabled: boolean; sound_path: string; theme: Theme; auto_update: boolean; last_update_check: number };
+type ProductSeen = { last_seen: number; last_completed: number; last_note: string | null };
+type Settings = { antigravity: Record<string, ProductSeen>; enabled: boolean; sound_path: string; theme: Theme; auto_update: boolean; last_update_check: number; language: string };
 type NotificationEvent = { source: string; timestamp: number };
-type Status = { settings: Settings; received: number; listener_ok: boolean; last_event: NotificationEvent | null };
+type Status = { settings: Settings; system_language: string; received: number; listener_ok: boolean; last_event: NotificationEvent | null };
 type ProviderId = 'claude' | 'codex' | 'antigravity';
-type ProviderState = 'not_installed' | 'available' | 'connected' | 'permission_required' | 'failed' | 'unsupported';
+type ProviderState = 'not_installed' | 'available' | 'connected' | 'repair_required' | 'permission_required' | 'failed' | 'unsupported';
 type ProviderReport = { id: ProviderId; state: ProviderState; detail: string | null };
 type Progress = { operation: 'install' | 'uninstall'; provider: ProviderId; phase: 'waiting' | 'working' | 'done' | 'failed' | 'skipped'; state: ProviderState; message: string };
 type UpdateMeta = { version: string; notes: string | null; date: string | null };
-type UpdateSnapshot = { configured: boolean; current_version: string; latest: UpdateMeta | null; downloaded: boolean };
+type UpdateSnapshot = { configured: boolean; current_version: string; latest: UpdateMeta | null; downloaded: boolean; last_error: string | null; interval_minutes: number };
 type DownloadProgress = { downloaded: number; total: number | null; phase: 'downloading' | 'verifying' | 'ready' };
 
 // Static assets in /public/assets/providers. `mono` logos use currentColor, so they are drawn as a CSS
 // mask to follow the light/dark text color; brand-colored logos are shown unchanged.
-const PROVIDERS: { id: ProviderId; name: string; mark: string; logo: string; mono: boolean }[] = [
-  { id: 'claude', name: 'Claude Code', mark: 'C', logo: '/assets/providers/claude-ai.svg', mono: false },
-  { id: 'codex', name: 'Codex CLI / Desktop', mark: '>_', logo: '/assets/providers/openai-chatgpt.svg', mono: true },
-  { id: 'antigravity', name: 'Antigravity', mark: 'A', logo: '/assets/providers/antigravity.png', mono: false },
+const PROVIDERS: { id: ProviderId; mark: string; logo: string; mono: boolean }[] = [
+  { id: 'claude', mark: 'C', logo: '/assets/providers/claude-ai.svg', mono: false },
+  { id: 'codex', mark: '>_', logo: '/assets/providers/openai-chatgpt.svg', mono: true },
+  { id: 'antigravity', mark: 'A', logo: '/assets/providers/antigravity.png', mono: false },
 ];
-const STATE_LABEL: Record<ProviderState, string> = {
-  not_installed: 'Kurulu değil',
-  available: 'Kullanılabilir',
-  connected: 'Bağlı',
-  permission_required: 'İzin gerekli',
-  failed: 'Başarısız',
-  unsupported: 'Desteklenmiyor',
-};
+// Backend detail codes that have a translation.
+const DETAIL_CODES = ['unsupported_os', 'repair_required', 'not_detected', 'readonly_config', 'already_connected', 'skipped_not_detected', 'skipped', 'waiting'];
 
 const el = <T extends HTMLElement>(id: string) => document.getElementById(id) as T;
 const installBtn = el<HTMLButtonElement>('install-integrations');
@@ -38,15 +35,19 @@ const uninstallBtn = el<HTMLButtonElement>('uninstall-integrations');
 const updateBtn = el<HTMLButtonElement>('update-action');
 const enabledBox = el<HTMLInputElement>('enabled');
 const autoUpdateBox = el<HTMLInputElement>('auto-update');
+const autostartBox = el<HTMLInputElement>('autostart');
 
 let reports: ProviderReport[] = [];
 let busy = false; // integration operation in flight
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
+let status: Status | null = null;
 let settings: Settings | null = null;
 let update: UpdateSnapshot | null = null;
 let updateMode: 'check' | 'download' | 'install' = 'check';
 let updateBusy = false;
 let updateError: string | null = null;
+let languageApplied = false;
+let showSetupHold = false; // keep the onboarding view visible while the final install states are shown
 const live = new Map<ProviderId, Progress>();
 
 function notify(message: string, isError = false) {
@@ -57,16 +58,17 @@ function notify(message: string, isError = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => toast.classList.remove('visible'), 3800);
 }
+const fail = (error: unknown) => notify(errorText(error), true);
 function setLoading(button: HTMLButtonElement, on: boolean) {
   button.classList.toggle('loading', on);
   button.disabled = on;
 }
-async function flash(button: HTMLButtonElement, ok: boolean) {
+function flash(button: HTMLButtonElement, ok: boolean) {
   button.classList.add(ok ? 'success' : 'error');
   setTimeout(() => button.classList.remove('success', 'error'), 1500);
 }
 
-/* ---------- theme ---------- */
+/* ---------- theme & language ---------- */
 function applyTheme(theme: Theme) {
   if (theme === 'system') delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = theme;
@@ -78,10 +80,26 @@ document.querySelectorAll<HTMLElement>('[data-theme-choice]').forEach((b) =>
   b.addEventListener('click', async () => {
     const theme = b.dataset.themeChoice as Theme;
     applyTheme(theme);
-    try { await invoke('set_theme', { theme }); } catch (e) { notify(String(e), true); }
+    try { await invoke('set_theme', { theme }); } catch (e) { fail(e); }
+  }));
+
+function markLanguageChoice(preference: string) {
+  document.querySelectorAll<HTMLElement>('[data-language-choice]').forEach((b) =>
+    b.setAttribute('aria-checked', String(b.dataset.languageChoice === preference)));
+}
+document.querySelectorAll<HTMLElement>('[data-language-choice]').forEach((b) =>
+  b.addEventListener('click', async () => {
+    const preference = b.dataset.languageChoice!;
+    markLanguageChoice(preference);
+    if (settings) settings.language = preference;
+    setLanguage(resolveLanguage(preference, status?.system_language)); // instant, no restart
+    try { await invoke('set_language', { language: preference }); } catch (e) { fail(e); }
   }));
 
 /* ---------- integrations ---------- */
+const detailText = (code: string | null | undefined) =>
+  code && DETAIL_CODES.includes(code) ? t(`detail.${code}` as Key) : (code ?? '');
+
 function providerAvatar(meta: (typeof PROVIDERS)[number]): HTMLSpanElement {
   const avatar = Object.assign(document.createElement('span'), { className: 'avatar' });
   avatar.setAttribute('aria-hidden', 'true');
@@ -101,40 +119,42 @@ function providerAvatar(meta: (typeof PROVIDERS)[number]): HTMLSpanElement {
   }
   return avatar;
 }
+
 function providerRow(id: ProviderId): HTMLLIElement {
   const meta = PROVIDERS.find((p) => p.id === id)!;
   const li = document.createElement('li');
-  const avatar = providerAvatar(meta);
-  const name = Object.assign(document.createElement('span'), { className: 'strong', textContent: meta.name });
+  const name = Object.assign(document.createElement('span'), { className: 'strong', textContent: t(`provider.${id}` as Key) });
   const state = Object.assign(document.createElement('span'), { className: 'pstate' });
   const report = reports.find((r) => r.id === id);
   const progress = live.get(id);
   let cls = '';
-  let text = report ? STATE_LABEL[report.state] : 'Kontrol ediliyor';
-  let title = report?.detail ?? '';
+  let text: string = report ? t(`state.${report.state}` as Key) : t('state.checking');
+  let title = report?.detail ? detailText(report.detail) : '';
   if (progress && (busy || progress.phase === 'failed')) {
-    title = progress.message;
-    if (progress.phase === 'waiting') text = 'Sırada';
+    title = progress.phase === 'failed' ? errorText(progress.message) : detailText(progress.message);
+    if (progress.phase === 'waiting') text = t('phase.waiting');
     else if (progress.phase === 'working') {
       state.append(Object.assign(document.createElement('span'), { className: 'spin' }));
-      text = progress.operation === 'install' ? 'Kuruluyor…' : 'Kaldırılıyor…';
-    } else if (progress.phase === 'failed') { text = 'Başarısız'; cls = 'failed'; }
-    else if (progress.phase === 'done') { text = progress.operation === 'install' ? 'Bağlandı' : 'Kaldırıldı'; cls = progress.operation === 'install' ? 'connected' : ''; }
-    else text = progress.state === 'connected' ? 'Bağlı' : STATE_LABEL[progress.state];
+      text = progress.operation === 'install' ? t('phase.installing') : t('phase.uninstalling');
+    } else if (progress.phase === 'failed') { text = t('phase.failed'); cls = 'failed'; }
+    else if (progress.phase === 'done') { text = progress.operation === 'install' ? t('phase.connected') : t('phase.removed'); cls = progress.operation === 'install' ? 'connected' : ''; }
+    else text = t(`state.${progress.state}` as Key);
   } else if (report?.state === 'connected') cls = 'connected';
   else if (report?.state === 'failed') cls = 'failed';
   state.append(document.createTextNode(text));
-  state.classList.add(...(cls ? [cls] : []));
+  if (cls) state.classList.add(cls);
   if (title) state.title = title;
-  li.append(avatar, name, state);
+  li.append(providerAvatar(meta), name, state);
   return li;
 }
+
 function renderProviders() {
+  queueMicrotask(renderAntigravityDiag);
   for (const id of ['setup-providers', 'dash-providers']) {
     el(id).replaceChildren(...PROVIDERS.map((p) => providerRow(p.id)));
   }
-  const connected = reports.filter((r) => r.state === 'connected').length;
-  const actionable = reports.filter((r) => r.state === 'available' || r.state === 'permission_required').length;
+  const connected = reports.filter((r) => r.state === 'connected' || r.state === 'repair_required').length;
+  const actionable = reports.filter((r) => ['available', 'permission_required', 'repair_required'].includes(r.state)).length;
   const failed = reports.filter((r) => r.state === 'failed');
   const unsupported = reports.length > 0 && reports.every((r) => r.state === 'unsupported');
   if (!busy) {
@@ -146,17 +166,18 @@ function renderProviders() {
   uninstallBtn.disabled = busy || connected === 0;
   const feedback = el('setup-feedback');
   feedback.classList.toggle('problem', failed.length > 0 || unsupported);
-  feedback.textContent = unsupported ? 'Bu platform desteklenmiyor; hook kurulumu yalnızca Windows üzerinde çalışır.'
-    : failed.length > 0 ? `${failed.length} entegrasyon kurulamadı: ${failed.map((f) => f.detail ?? '').filter(Boolean).join('; ') || 'ayrıntı yok'}. Tekrar deneyebilirsin.`
-    : reports.length > 0 && actionable === 0 && connected === 0 ? 'Desteklenen bir araç bulunamadı. Claude Code, Codex veya Antigravity\'yi bir kez çalıştırıp tekrar dene.'
-    : 'Codex Computer Use dahil mevcut ayarlar korunur.';
+  feedback.textContent = unsupported ? t('onboarding.unsupported')
+    : failed.length > 0 ? t('onboarding.failed', { n: failed.length, details: failed.map((f) => (f.detail ? errorText(f.detail) : '')).filter(Boolean).join('; ') || '—' })
+    : reports.length > 0 && actionable === 0 && connected === 0 ? t('onboarding.noneDetected')
+    : reports.length === 0 ? t('onboarding.checking')
+    : t('onboarding.preserved');
+  const allConnected = reports.length > 0 && reports.every((r) => r.state === 'connected');
   const msg = el('integration-message');
   msg.classList.toggle('problem', failed.length > 0);
-  msg.textContent = failed.length > 0 ? `Bazı entegrasyonlar tamamlanamadı (${failed.length}). Onar ile yeniden dene.`
-    : connected === PROVIDERS.length ? 'Tüm hook\'lar bağlı. Codex ilk kullanımda Settings > Hooks üzerinden güven onayı isteyebilir.'
-    : 'Bazı entegrasyonlar bağlı değil. Eksikleri kur / Onar ile yeniden deneyebilirsin.';
+  msg.textContent = failed.length > 0 ? t('integrations.partialFailure', { n: failed.length })
+    : allConnected ? t('integrations.allConnected')
+    : t('integrations.someMissing');
 }
-let showSetupHold = false; // keep the onboarding view visible while the final install states are shown
 
 async function refreshIntegrations() {
   reports = await invoke<ProviderReport[]>('get_integrations');
@@ -174,18 +195,15 @@ async function runOperation(install: boolean, trigger: HTMLButtonElement) {
     const connected = reports.filter((r) => r.state === 'connected').length;
     const failed = reports.filter((r) => r.state === 'failed').length;
     flash(trigger, failed === 0);
-    if (install) {
-      notify(failed === 0 && connected > 0 ? 'Entegrasyonlar bağlandı' : `${connected} bağlandı, ${failed} başarısız`, failed > 0 || connected === 0);
-    } else {
-      notify(failed === 0 && connected === 0 ? 'Entegrasyonlar kaldırıldı' : 'Kaldırma tamamlanamadı; bazı hook\'lar duruyor', true);
-    }
+    if (install) notify(failed === 0 && connected > 0 ? t('toast.connected') : t('toast.partial', { ok: connected, failed }), failed > 0 || connected === 0);
+    else notify(failed === 0 && connected === 0 ? t('toast.removed') : t('toast.removeIncomplete'), failed > 0 || connected > 0);
     // Show the real final states briefly, then let the connected count pick the view.
     showSetupHold = install && connected > 0 && el('dashboard-view').hidden;
     busy = false;
     renderProviders();
     if (showSetupHold) { await new Promise((r) => setTimeout(r, 900)); showSetupHold = false; renderProviders(); }
   } catch (error) {
-    notify(String(error), true);
+    fail(error);
     flash(trigger, false);
     busy = false;
     try { await refreshIntegrations(); } catch { /* keep first error */ }
@@ -206,54 +224,101 @@ uninstallBtn.addEventListener('click', () => {
 
 /* ---------- status / sound / settings ---------- */
 function presentSound(path: string) {
-  el('sound-name').textContent = path ? (path.split(/[\\/]/).pop() ?? path) : 'Kaiwen Default';
-  el('sound-info').textContent = path ? 'Özel WAV sesi' : 'Yerleşik kısa bildirim sesi';
+  el('sound-name').textContent = path ? (path.split(/[\\/]/).pop() ?? path) : t('sound.defaultName');
+  el('sound-info').textContent = path ? t('sound.customInfo') : t('sound.defaultInfo');
 }
-function renderStatus(status: Status) {
-  settings = status.settings;
-  enabledBox.checked = settings.enabled;
-  autoUpdateBox.checked = settings.auto_update;
-  applyTheme(settings.theme);
+/** Per-runtime proof that Antigravity really ran our hook; a hook file alone is never shown as success. */
+function renderAntigravityDiag() {
+  const box = el('antigravity-diag');
+  const state = reports.find((r) => r.id === 'antigravity')?.state;
+  box.hidden = !(state === 'connected' || state === 'repair_required');
+  if (box.hidden) return;
+  const when = (ms: number) => new Date(ms).toLocaleString(t('time.locale'));
+  const rows = (['app', 'ide', 'cli'] as const).map((key) => {
+    const seen = settings?.antigravity?.[key];
+    const row = document.createElement('div');
+    row.className = 'diag-row';
+    const who = Object.assign(document.createElement('span'), { className: 'who', textContent: t(`diag.${key}` as Key) });
+    const what = document.createElement('span');
+    what.className = 'what';
+    if (!seen || seen.last_seen === 0) what.textContent = t('diag.none');
+    else if (seen.last_completed > 0 && !seen.last_note) { what.textContent = t('diag.verified', { time: when(seen.last_completed) }); what.classList.add('ok'); }
+    else {
+      const why = seen.last_note ? t(`diag.note.${seen.last_note}` as Key) : '';
+      what.textContent = t('diag.ranSilent', { time: when(seen.last_seen), why });
+    }
+    row.append(who, what);
+    return row;
+  });
+  const title = Object.assign(document.createElement('h3'), { textContent: t('diag.title') });
+  const hint = Object.assign(document.createElement('p'), { className: 'note', textContent: t('diag.hint') });
+  box.replaceChildren(title, ...rows, hint);
+}
+function renderStatus() {
+  if (!status || !settings) return;
   presentSound(settings.sound_path);
   const active = status.listener_ok && settings.enabled;
   el('status-dot').className = `dot ${active ? 'active' : status.listener_ok ? '' : 'offline'}`;
-  el('status-label').textContent = !status.listener_ok ? 'Yerel dinleyici açılamadı' : settings.enabled ? 'Dinleniyor · Arka planda aktif' : 'Bildirimler duraklatıldı';
-  el('event-count').textContent = `${status.received} bildirim`;
-  el('last-event').textContent = status.last_event ? `Son: ${status.last_event.source} · ${new Date(status.last_event.timestamp).toLocaleTimeString()}` : 'Henüz görev bildirimi alınmadı.';
+  el('status-label').textContent = !status.listener_ok ? t('status.listenerFailed') : settings.enabled ? t('status.listening') : t('status.paused');
+  el('event-count').textContent = t('status.count', { n: status.received });
+  el('last-event').textContent = status.last_event
+    ? t('status.last', { source: status.last_event.source, time: new Date(status.last_event.timestamp).toLocaleTimeString(t('time.locale')) })
+    : t('status.none');
+  renderAntigravityDiag();
+  el('auto-update-desc').textContent = t('settings.autoUpdateDesc', { n: update?.interval_minutes ?? 10 });
+}
+function applyStatus(next: Status) {
+  status = next;
+  settings = next.settings;
+  enabledBox.checked = settings.enabled;
+  autoUpdateBox.checked = settings.auto_update;
+  applyTheme(settings.theme);
+  markLanguageChoice(settings.language);
+  const resolved = resolveLanguage(settings.language, next.system_language);
+  if (!languageApplied || resolved !== language()) { languageApplied = true; setLanguage(resolved); }
+  renderStatus();
   renderUpdate();
 }
-async function reload() { renderStatus(await invoke<Status>('get_status')); }
+async function reload() { applyStatus(await invoke<Status>('get_status')); }
 enabledBox.addEventListener('change', async () => {
-  try { await invoke('set_enabled', { enabled: enabledBox.checked }); } catch (e) { notify(String(e), true); }
+  try { await invoke('set_enabled', { enabled: enabledBox.checked }); } catch (e) { fail(e); }
   await reload();
 });
 autoUpdateBox.addEventListener('change', async () => {
-  try { await invoke('set_auto_update', { enabled: autoUpdateBox.checked }); } catch (e) { notify(String(e), true); }
+  try { await invoke('set_auto_update', { enabled: autoUpdateBox.checked }); } catch (e) { fail(e); }
   await reload();
+});
+autostartBox.addEventListener('change', async () => {
+  const wanted = autostartBox.checked;
+  try {
+    // The backend returns the real OS registration state after the change.
+    autostartBox.checked = await invoke<boolean>('set_autostart', { enabled: wanted });
+    notify(t(autostartBox.checked ? 'toast.autostartOn' : 'toast.autostartOff'));
+  } catch (e) { fail(e); autostartBox.checked = !wanted; }
 });
 el('pick-sound').addEventListener('click', async () => {
   try {
-    const path = await open({ multiple: false, directory: false, filters: [{ name: 'Wave Audio', extensions: ['wav'] }] });
+    const path = await open({ multiple: false, directory: false, filters: [{ name: t('sound.filter'), extensions: ['wav'] }] });
     if (!path || Array.isArray(path)) return;
     await invoke('set_sound', { path });
     await reload();
-    notify('Ses kaydedildi');
-  } catch (e) { notify(String(e), true); }
+    notify(t('sound.saved'));
+  } catch (e) { fail(e); }
 });
 el('reset-sound').addEventListener('click', async () => {
-  try { await invoke('set_sound', { path: '' }); await reload(); notify('Varsayılan ses seçildi'); }
-  catch (e) { notify(String(e), true); }
+  try { await invoke('set_sound', { path: '' }); await reload(); notify(t('sound.resetDone')); }
+  catch (e) { fail(e); }
 });
 const testBtn = el<HTMLButtonElement>('test-sound');
 testBtn.addEventListener('click', async () => {
   setLoading(testBtn, true);
   try { await invoke('test_sound'); flash(testBtn, true); }
-  catch (e) { notify(String(e), true); flash(testBtn, false); }
+  catch (e) { fail(e); flash(testBtn, false); }
   finally { setLoading(testBtn, false); }
 });
 
 /* ---------- updates ---------- */
-const mb = (n: number) => {
+const bytes = (n: number) => {
   if (n < 1024) return `${n} B`;
   if (n < 1048576) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
   return `${(n / 1048576).toFixed(n < 10485760 ? 1 : 0)} MB`;
@@ -272,26 +337,31 @@ function renderUpdate() {
   const sub = el('update-sub');
   const notes = el<HTMLPreElement>('update-notes');
   const label = updateBtn.querySelector('.btn-label')!;
-  const last = settings?.last_update_check ? `Son kontrol: ${new Date(settings.last_update_check).toLocaleString()}` : 'Henüz kontrol edilmedi';
   notes.hidden = true;
-  if (!update) { title.textContent = 'Güncelleme durumu okunuyor…'; updateBtn.disabled = true; return; }
-  const current = `Mevcut sürüm v${update.current_version}`;
+  if (!update) { title.textContent = t('update.reading'); sub.textContent = ''; label.textContent = t('update.check'); updateBtn.disabled = true; return; }
+  const last = settings?.last_update_check
+    ? t('update.lastCheck', { time: new Date(settings.last_update_check).toLocaleString(t('time.locale')) })
+    : t('update.neverChecked');
   if (!update.configured) {
-    title.textContent = 'Güncelleme sunucusu yapılandırılmamış';
-    sub.textContent = `${current}. Bu derleme bir güncelleme kaynağına bağlı değil.`;
-    label.textContent = 'Güncellemeleri Kontrol Et';
+    title.textContent = t('update.notConfigured');
+    sub.textContent = t('update.notConfiguredSub', { v: update.current_version });
+    label.textContent = t('update.check');
     updateBtn.disabled = true;
     return;
   }
-  if (updateError) { title.textContent = 'Güncelleme başarısız'; sub.textContent = updateError; }
+  const subLine = t('update.sub', { v: update.current_version, last });
+  if (updateError) { title.textContent = t('update.failed'); sub.textContent = updateError; }
   else if (update.latest) {
-    title.textContent = update.downloaded ? `v${update.latest.version} indirildi` : `Yeni sürüm: v${update.latest.version}`;
-    sub.textContent = `${current} · ${last}`;
+    title.textContent = update.downloaded ? t('update.downloaded', { v: update.latest.version }) : t('update.available', { v: update.latest.version });
+    sub.textContent = subLine;
     if (update.latest.notes) { notes.hidden = false; notes.textContent = update.latest.notes; }
-  } else { title.textContent = 'Uygulama güncel'; sub.textContent = `${current} · ${last}`; }
+  } else {
+    title.textContent = t('update.upToDate');
+    sub.textContent = update.last_error ? `${subLine} · ${t('update.autoError', { error: errorText(update.last_error) })}` : subLine;
+  }
   updateMode = update.latest ? (update.downloaded ? 'install' : 'download') : 'check';
-  label.textContent = updateMode === 'install' ? 'Kur ve Yeniden Başlat'
-    : updateMode === 'download' ? (updateError ? 'Tekrar dene' : 'İndir') : 'Güncellemeleri Kontrol Et';
+  label.textContent = updateMode === 'install' ? t('update.install')
+    : updateMode === 'download' ? (updateError ? t('update.retry') : t('update.download')) : t('update.check');
   updateBtn.classList.toggle('btn-primary', updateMode !== 'check');
   updateBtn.disabled = updateBusy;
 }
@@ -304,17 +374,17 @@ async function updateAction() {
     if (updateMode === 'check') {
       update = await invoke<UpdateSnapshot>('check_update');
       await reload();
-      if (!update.latest) notify('Uygulama güncel');
+      if (!update.latest) notify(t('update.nowUpToDate'));
     } else if (updateMode === 'download') {
-      setProgress(true, false, 0, 'İndirme başlıyor…');
+      setProgress(true, false, 0, t('update.starting'));
       update = await invoke<UpdateSnapshot>('download_update');
       setProgress(false);
     } else {
-      setProgress(true, false, 0, 'Yükleyici başlatılıyor…');
+      setProgress(true, false, 0, t('update.launching'));
       await invoke('install_update'); // on success Windows closes the app and the installer relaunches it
     }
   } catch (error) {
-    updateError = String(error);
+    updateError = errorText(error);
     setProgress(false);
     notify(updateError, true);
     flash(updateBtn, false);
@@ -327,31 +397,39 @@ async function updateAction() {
 updateBtn.addEventListener('click', () => { void updateAction(); });
 
 /* ---------- events (registered once; Rust only emits when something happens) ---------- */
+onLanguageChange(() => { renderProviders(); renderStatus(); renderUpdate(); });
 void listen<NotificationEvent>('notify-event', () => { void reload(); });
+void listen<string>('hook-seen', () => { void reload(); });
 void listen<Progress>('integration-progress', (e) => {
   live.set(e.payload.provider, e.payload);
-  // Make the real progress visible even when triggered from the dashboard.
   renderProviders();
 });
 void listen<DownloadProgress>('update-progress', (e) => {
   const { downloaded, total, phase } = e.payload;
-  if (phase === 'verifying') setProgress(true, false, 0, 'İmza doğrulanıyor…');
-  else if (total && total > 0) setProgress(true, true, downloaded / total, `%${Math.floor((downloaded / total) * 100)} · ${mb(downloaded)} / ${mb(total)}`);
-  else setProgress(true, false, 0, downloaded > 0 ? `${mb(downloaded)} indirildi` : 'İndirme başlıyor…');
+  if (phase === 'verifying') setProgress(true, false, 0, t('update.verifying'));
+  else if (total && total > 0) {
+    setProgress(true, true, downloaded / total, t('update.progress', { pct: Math.floor((downloaded / total) * 100), done: bytes(downloaded), total: bytes(total) }));
+  } else setProgress(true, false, 0, downloaded > 0 ? t('update.progressUnknown', { done: bytes(downloaded) }) : t('update.starting'));
 });
+// Background checks may find an update while this window is open; keep the state identical to the tray's.
 void listen<UpdateSnapshot>('update-state', (e) => { update = e.payload; void reload(); });
 
 (async () => {
   try {
-    document.getElementById('app-version')!.textContent = '';
-    await Promise.all([reload(), refreshIntegrations()]);
+    await reload();
     update = await invoke<UpdateSnapshot>('get_update_state');
     el('app-version').textContent = `v${update.current_version}`;
+    autostartBox.checked = await invoke<boolean>('get_autostart').catch(() => false);
+    await refreshIntegrations();
+    renderStatus();
     renderUpdate();
   } catch (error) {
-    notify(String(error), true);
+    notify(errorText(error), true);
     el('setup-view').hidden = false;
-    el('setup-feedback').textContent = `Durum okunamadı: ${String(error)}`;
+    el('setup-feedback').textContent = t('onboarding.statusError', { error: errorText(error) });
     el('setup-feedback').classList.add('problem');
+  } finally {
+    // Tell the backend the first render is done so it can reveal the window (no blank flash).
+    void invoke('app_ready').catch(() => undefined);
   }
 })();
