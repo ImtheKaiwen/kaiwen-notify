@@ -773,6 +773,8 @@ pub fn run() {
             });
             app.manage(TrayState(Mutex::new(None)));
 
+            // Bridge fixes shipped in an update reach already installed hooks without pressing Repair.
+            integrations::refresh_bridge_script();
             start_udp_listener(app.handle().clone());
             let lang = i18n::resolve(
                 &app.state::<AppState>()

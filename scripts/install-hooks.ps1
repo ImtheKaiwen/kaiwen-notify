@@ -36,6 +36,27 @@ function Set-Property($Object, [string]$Name, $Value) {
     else { $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value }
 }
 
+# ---- Antigravity hook command (single contract; keep in sync with src-tauri/src/integrations.rs) ----
+# Antigravity passes the quotes of a quoted `-File "path"` argument through to PowerShell, which then fails with
+# "invalid characters in path". An -EncodedCommand has no spaces or quotes at all, and the script path is
+# resolved at run time from %LOCALAPPDATA%, so the identical command works for every Windows user name/path.
+$AntigravityScriptText = @'
+$ProgressPreference = 'SilentlyContinue'; $d = $env:LOCALAPPDATA; if (-not $d) { $d = [Environment]::GetFolderPath('LocalApplicationData') }; & (Join-Path $d 'KaiwenNotify\hooks\send-event.ps1') -Source antigravity
+'@
+$AntigravityCommand = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand ' +
+    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($AntigravityScriptText))
+# Returns 'current' (this contract), 'compatible' (older unquoted -File form that works because the path has no
+# spaces/non-ASCII characters), 'legacy' (older quoted forms that fail under Antigravity) or $null (not ours).
+function Get-AntigravityHandlerKind($Handler) {
+    if ($null -eq $Handler -or -not (Has-Property $Handler 'command') -or $Handler.type -ne 'command') { return $null }
+    $cmd = [string]$Handler.command
+    if ($cmd -ceq $AntigravityCommand) { return 'current' }
+    $m = [regex]::Match($cmd, '^powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ("?)([^"]*KaiwenNotify[\\/]hooks[\\/]send-event\.ps1)\1 -Source antigravity$')
+    if (-not $m.Success) { return $null }
+    if ($m.Groups[1].Value -eq '' -and $m.Groups[2].Value -cmatch '^[\x21-\x7E]+$') { return 'compatible' }
+    return 'legacy'
+}
+
 $target = Join-Path $env:LOCALAPPDATA 'KaiwenNotify\hooks'
 $hookScript = Join-Path $target 'send-event.ps1'
 [void](New-Item -ItemType Directory -Force -Path $target)
@@ -61,37 +82,43 @@ if (-not $already) {
 }
 
 if ($Provider -in 'all','antigravity') {
-# 2. Google Antigravity: global, named Stop hook group.
+# 2. Google Antigravity (Desktop App, IDE and CLI read the same global file): named Stop hook group.
 $antiPath = Join-Path $env:USERPROFILE '.gemini\config\hooks.json'
 $anti = Read-JsonObject $antiPath
-# Forward slashes survive both Windows and POSIX-style command splitters (Antigravity is a Go
-# program); a backslash path inside quotes can lose its separators under POSIX-style parsing.
-$hookScriptFwd = $hookScript.Replace('\', '/')
-$cmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScriptFwd + '" -Source antigravity'
-$legacyCmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript + '" -Source antigravity'
+$newHandler = { [pscustomobject]@{ type = 'command'; command = $AntigravityCommand; timeout = 10 } }
+$changed = $false
 if (-not (Has-Property $anti 'kaiwen-notify')) {
-    $group = [pscustomobject]@{ enabled = $true; Stop = @([pscustomobject]@{ type = 'command'; command = $cmd; timeout = 10 }) }
-    Set-Property $anti 'kaiwen-notify' $group
-    Backup-Existing $antiPath
-    Write-Utf8 $antiPath ($anti | ConvertTo-Json -Depth 40)
+    Set-Property $anti 'kaiwen-notify' ([pscustomobject]@{ enabled = $true; Stop = @(& $newHandler) })
+    $changed = $true
     Write-Host 'Antigravity: etkin.'
 } else {
-    # Migrate only our own legacy (backslash) handler; leave anything else in the group alone.
     $group = $anti.'kaiwen-notify'
-    $migrated = 0
-    if (Has-Property $group 'Stop') {
-        foreach ($handler in @($group.Stop)) {
-            if ($null -ne $handler -and (Has-Property $handler 'command') -and $handler.command -ceq $legacyCmd) {
-                $handler.command = $cmd
-                $migrated++
-            }
-        }
-    }
-    if ($migrated -gt 0) {
-        Backup-Existing $antiPath
-        Write-Utf8 $antiPath ($anti | ConvertTo-Json -Depth 40)
+    if (-not (Has-Property $group 'Stop')) { Set-Property $group 'Stop' @() }
+    $handlers = @($group.Stop | Where-Object { $null -ne $_ })
+    $ours = @($handlers | Where-Object { $null -ne (Get-AntigravityHandlerKind $_) })
+    $keep = @($ours | Where-Object { (Get-AntigravityHandlerKind $_) -eq 'current' }) + @($ours | Where-Object { (Get-AntigravityHandlerKind $_) -eq 'compatible' })
+    if ($keep.Count -gt 0) {
+        # A working handler exists; only drop duplicates/legacy leftovers of ours. Other people's handlers stay.
+        if ($ours.Count -gt 1) {
+            $group.Stop = @(@($handlers | Where-Object { $null -eq (Get-AntigravityHandlerKind $_) }) + @($keep[0]))
+            $changed = $true
+            Write-Host 'Antigravity: yinelenen eski komutlar temizlendi.'
+        } else { Write-Host 'Antigravity: zaten kurulu.' }
+    } elseif ($ours.Count -gt 0) {
+        # Only broken legacy forms: upgrade the first in place, drop the rest.
+        $ours[0].command = $AntigravityCommand
+        $group.Stop = @(@($handlers | Where-Object { $null -eq (Get-AntigravityHandlerKind $_) -or [object]::ReferenceEquals($_, $ours[0]) }))
+        $changed = $true
         Write-Host 'Antigravity: eski komut guncellendi.'
-    } else { Write-Host 'Antigravity: zaten kurulu.' }
+    } else {
+        $group.Stop = @($handlers) + @(& $newHandler)
+        $changed = $true
+        Write-Host 'Antigravity: etkin.'
+    }
+}
+if ($changed) {
+    Backup-Existing $antiPath
+    Write-Utf8 $antiPath ($anti | ConvertTo-Json -Depth 40)
 }
 }
 

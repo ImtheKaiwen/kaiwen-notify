@@ -46,7 +46,7 @@ def test_rollback_contract():
     assert 'param([switch]$DryRun' in undo
     assert 'Backup-Existing' in undo
     assert "$handler.command -ceq $claudeExpected" in undo
-    assert "$antiExpected -ccontains $_.command" in undo
+    assert "Get-AntigravityHandlerKind" in undo
     assert '$handler.command -ceq $codexExpected' in undo
     assert 'Commit-Json $codexHooksPath' in undo
     # Older v0.2 installs can be cleaned up without erasing any custom/native notify.

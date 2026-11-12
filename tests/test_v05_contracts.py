@@ -166,7 +166,8 @@ def test_update_scheduler_design():
 
 # ---- portability --------------------------------------------------------------------------------
 def test_no_machine_specific_paths_in_shipped_files():
-    patterns = [r'C:\\\\?Users\\\\?[A-Za-z]', r'C:/Users/[A-Za-z]', r'OneDrive\\\\?Desktop', r'C:\\\\?dev\b']
+    # The maintainer's own profile and project folders must never be baked into shipped code.
+    patterns = [r'Users[\/]+kaiwe', r'OneDrive[\/]+Desktop', r'[A-Za-z]:[\/]+dev[\/]']
     shipped = ['src', 'src-tauri/src', 'scripts', 'index.html', 'splash.html', 'src-tauri/tauri.conf.json',
                'src-tauri/capabilities', 'src-tauri/windows']
     offenders = []
@@ -175,10 +176,8 @@ def test_no_machine_specific_paths_in_shipped_files():
         files = [base] if base.is_file() else [p for p in base.rglob('*') if p.is_file()]
         for f in files:
             text = f.read_text(encoding='utf8', errors='ignore')
-            for pat in patterns:
-                # test fixtures inside comments such as "C:/x" are fine; real user names are not
-                if re.search(pat, text) and 'kaiwe' in text.lower():
-                    offenders.append(str(f.relative_to(ROOT)))
+            if any(re.search(pat, text, re.I) for pat in patterns):
+                offenders.append(str(f.relative_to(ROOT)))
     assert not offenders, offenders
 
 

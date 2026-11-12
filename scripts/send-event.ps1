@@ -14,16 +14,24 @@ function Write-Diag([string]$Text) {
     try {
         $dir = Join-Path $env:LOCALAPPDATA 'KaiwenNotify'
         if (Test-Path -LiteralPath (Join-Path $dir 'diag.enabled')) {
-            Add-Content -LiteralPath (Join-Path $dir 'diag.log') -Value ("{0} {1} {2}" -f (Get-Date -Format o), $Source, $Text)
+            $log = Join-Path $dir 'diag.log'
+            # Keep the opt-in log bounded: roll over at 256 KB.
+            if ((Test-Path -LiteralPath $log) -and (Get-Item -LiteralPath $log).Length -gt 262144) {
+                Move-Item -LiteralPath $log -Destination ($log + '.1') -Force
+            }
+            Add-Content -LiteralPath $log -Value ("{0} {1} {2}" -f (Get-Date -Format o), $Source, $Text)
         }
     } catch { }
 }
 
 function Send-Udp([string]$Message) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($Message)
+    # The listener port is fixed; the env override exists only so tests can run beside a live app.
+    $port = 47451
+    if ($env:KAIWEN_NOTIFY_PORT -match '^[0-9]{4,5}$') { $port = [int]$env:KAIWEN_NOTIFY_PORT }
     $udp = New-Object System.Net.Sockets.UdpClient
     try {
-        $udp.Connect('127.0.0.1', 47451)
+        $udp.Connect('127.0.0.1', $port)
         [void]$udp.Send($bytes, $bytes.Length)
     }
     finally { $udp.Dispose() }

@@ -106,14 +106,104 @@ pub fn home_dir() -> Result<PathBuf, String> {
     ))
 }
 
-/// Antigravity gets a forward-slash path (robust to POSIX-style command splitting); the older
-/// backslash form written by 0.4.0 is still recognised so existing installs keep working.
-pub fn antigravity_commands(script: &Path) -> [String; 2] {
-    let fwd = script.display().to_string().replace('\\', "/");
-    [
-        format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{fwd}\" -Source antigravity"),
-        hook_command(script, "antigravity"),
-    ]
+/// The one Antigravity hook command (keep identical to `$AntigravityScriptText` in the PowerShell scripts).
+///
+/// Antigravity forwards the quotes of a quoted `-File "path"` argument to PowerShell, which then fails with
+/// "invalid characters in path". An `-EncodedCommand` contains no spaces or quotes, and the script path is
+/// resolved at run time from `%LOCALAPPDATA%`, so this exact string works for every Windows user and path.
+const ANTIGRAVITY_SCRIPT_TEXT: &str = "$ProgressPreference = 'SilentlyContinue'; $d = $env:LOCALAPPDATA; if (-not $d) { $d = [Environment]::GetFolderPath('LocalApplicationData') }; & (Join-Path $d 'KaiwenNotify\\hooks\\send-event.ps1') -Source antigravity";
+const POWERSHELL_PREFIX: &str =
+    "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass ";
+
+fn base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+pub fn antigravity_command() -> String {
+    let utf16le: Vec<u8> = ANTIGRAVITY_SCRIPT_TEXT
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    format!(
+        "{POWERSHELL_PREFIX}-OutputFormat Text -EncodedCommand {}",
+        base64(&utf16le)
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HandlerKind {
+    /// The current contract.
+    Current,
+    /// Older unquoted `-File` form; it works because the path has no spaces or non-ASCII characters.
+    Compatible,
+    /// Older quoted forms that Antigravity breaks.
+    Legacy,
+}
+
+/// Classifies one Antigravity handler command; `None` means it is not Kaiwen Notify's.
+pub fn classify_antigravity(command: &str) -> Option<HandlerKind> {
+    if command == antigravity_command() {
+        return Some(HandlerKind::Current);
+    }
+    let rest = command.strip_prefix(POWERSHELL_PREFIX)?;
+    let middle = rest
+        .strip_prefix("-File ")?
+        .strip_suffix(" -Source antigravity")?;
+    let (path, quoted) = match middle.strip_prefix('"').and_then(|m| m.strip_suffix('"')) {
+        Some(inner) => (inner, true),
+        None => (middle, false),
+    };
+    if path.contains('"') {
+        return None;
+    }
+    let normalized = path.replace('\\', "/");
+    if !normalized.ends_with("KaiwenNotify/hooks/send-event.ps1") {
+        return None;
+    }
+    let plain = !quoted && path.bytes().all(|b| (0x21..=0x7E).contains(&b));
+    Some(if plain {
+        HandlerKind::Compatible
+    } else {
+        HandlerKind::Legacy
+    })
+}
+
+/// Kinds of our handlers found in `kaiwen-notify.Stop` of the shared Antigravity hooks file.
+pub fn antigravity_kinds(root: &serde_json::Value) -> Vec<HandlerKind> {
+    root.get("kaiwen-notify")
+        .and_then(|g| g.get("Stop"))
+        .and_then(|v| v.as_array())
+        .map(|handlers| {
+            handlers
+                .iter()
+                .filter(|h| h.get("type").and_then(|t| t.as_str()) == Some("command"))
+                .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+                .filter_map(classify_antigravity)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn hook_command(script: &Path, source: &str) -> String {
@@ -151,28 +241,29 @@ fn read_json_optional(path: &Path) -> serde_json::Value {
 
 fn is_connected(provider: Provider, home: &Path, script: &Path) -> bool {
     let json = read_json_optional(&provider.config_file(home));
-    let command = hook_command(script, provider.id());
     match provider {
-        Provider::Antigravity => antigravity_commands(script)
+        Provider::Antigravity => antigravity_kinds(&json)
             .iter()
-            .any(|c| has_own_hook(&json, &["kaiwen-notify", "Stop"], c)),
-        _ => has_own_hook(&json, &["hooks", "Stop"], &command),
+            .any(|k| matches!(k, HandlerKind::Current | HandlerKind::Compatible)),
+        _ => has_own_hook(
+            &json,
+            &["hooks", "Stop"],
+            &hook_command(script, provider.id()),
+        ),
     }
 }
 
-/// True when the Antigravity hook exists only in the older backslash form (0.4.0), so Install/Repair
-/// should run once to migrate it.
+/// True when Antigravity only has broken legacy handlers of ours, so Install/Repair should upgrade them.
 fn needs_migration(provider: Provider) -> bool {
     if provider != Provider::Antigravity {
         return false;
     }
-    let (Ok(home), Ok(script)) = (home_dir(), expected_hook_path()) else {
-        return false;
-    };
-    let json = read_json_optional(&provider.config_file(&home));
-    let [fwd, legacy] = antigravity_commands(&script);
-    has_own_hook(&json, &["kaiwen-notify", "Stop"], &legacy)
-        && !has_own_hook(&json, &["kaiwen-notify", "Stop"], &fwd)
+    let Ok(home) = home_dir() else { return false };
+    let kinds = antigravity_kinds(&read_json_optional(&provider.config_file(&home)));
+    !kinds.is_empty()
+        && !kinds
+            .iter()
+            .any(|k| matches!(k, HandlerKind::Current | HandlerKind::Compatible))
 }
 
 pub fn detect_one(provider: Provider) -> Result<ProviderReport, String> {
@@ -254,10 +345,32 @@ fn run_script(_: &Path, _: bool, _: Provider) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+const SEND_EVENT_SCRIPT: &str = include_str!("../../scripts/send-event.ps1");
+
+/// Keeps an already installed bridge script current after an app update, so bridge fixes reach existing
+/// hooks without the user pressing Repair. It only touches our own file and only when it differs.
+#[cfg(windows)]
+pub fn refresh_bridge_script() {
+    let Ok(path) = expected_hook_path() else {
+        return;
+    };
+    if !path.is_file() || fs::read_to_string(&path).is_ok_and(|c| c == SEND_EVENT_SCRIPT) {
+        return;
+    }
+    let tmp = path.with_extension("ps1.tmp");
+    if fs::write(&tmp, SEND_EVENT_SCRIPT).is_ok() && fs::rename(&tmp, &path).is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+}
+
+#[cfg(not(windows))]
+pub fn refresh_bridge_script() {}
+
+#[cfg(windows)]
 fn write_scripts(dir: &Path) -> Result<(), String> {
     const INSTALL: &str = include_str!("../../scripts/install-hooks.ps1");
     const UNINSTALL: &str = include_str!("../../scripts/uninstall-hooks.ps1");
-    const SEND: &str = include_str!("../../scripts/send-event.ps1");
+    const SEND: &str = SEND_EVENT_SCRIPT;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     for (name, body) in [
         ("send-event.ps1", SEND),
@@ -413,11 +526,96 @@ mod tests {
         assert!(!has_own_hook(&root, &["hooks", "Stop"], "other"));
     }
 
+    // Independently computed with Python: base64(utf-16-le(script text)).
+    const EXPECTED_B64: &str = "JABQAHIAbwBnAHIAZQBzAHMAUAByAGUAZgBlAHIAZQBuAGMAZQAgAD0AIAAnAFMAaQBsAGUAbgB0AGwAeQBDAG8AbgB0AGkAbgB1AGUAJwA7ACAAJABkACAAPQAgACQAZQBuAHYAOgBMAE8AQwBBAEwAQQBQAFAARABBAFQAQQA7ACAAaQBmACAAKAAtAG4AbwB0ACAAJABkACkAIAB7ACAAJABkACAAPQAgAFsARQBuAHYAaQByAG8AbgBtAGUAbgB0AF0AOgA6AEcAZQB0AEYAbwBsAGQAZQByAFAAYQB0AGgAKAAnAEwAbwBjAGEAbABBAHAAcABsAGkAYwBhAHQAaQBvAG4ARABhAHQAYQAnACkAIAB9ADsAIAAmACAAKABKAG8AaQBuAC0AUABhAHQAaAAgACQAZAAgACcASwBhAGkAdwBlAG4ATgBvAHQAaQBmAHkAXABoAG8AbwBrAHMAXABzAGUAbgBkAC0AZQB2AGUAbgB0AC4AcABzADEAJwApACAALQBTAG8AdQByAGMAZQAgAGEAbgB0AGkAZwByAGEAdgBpAHQAeQA=";
+
     #[test]
-    fn detects_antigravity_direct_handler() {
-        let cmd = hook_command(Path::new("C:/x/send-event.ps1"), "antigravity");
-        let root = json!({"kaiwen-notify":{"Stop":[{"type":"command","command":cmd}]}});
-        assert!(has_own_hook(&root, &["kaiwen-notify", "Stop"], &cmd));
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn antigravity_command_is_the_documented_encoded_form() {
+        let cmd = antigravity_command();
+        assert_eq!(
+            cmd,
+            format!("powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand {EXPECTED_B64}")
+        );
+        assert!(
+            !cmd.contains('"') && !cmd.contains('\\'),
+            "no quotes or backslashes to mangle"
+        );
+        assert!(
+            !cmd.to_lowercase().contains("users"),
+            "no user-specific path"
+        );
+        assert!(cmd.len() < 700);
+    }
+
+    #[test]
+    fn classifies_every_known_antigravity_form() {
+        let current = antigravity_command();
+        assert_eq!(classify_antigravity(&current), Some(HandlerKind::Current));
+        let p = "C:/Users/me/AppData/Local/KaiwenNotify/hooks/send-event.ps1";
+        let base = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File";
+        // v0.5.0 quoted forward slashes and v0.4.0 quoted backslashes: both broken under Antigravity
+        assert_eq!(
+            classify_antigravity(&format!("{base} \"{p}\" -Source antigravity")),
+            Some(HandlerKind::Legacy)
+        );
+        assert_eq!(
+            classify_antigravity(&format!(
+                "{base} \"{}\" -Source antigravity",
+                p.replace('/', "\\")
+            )),
+            Some(HandlerKind::Legacy)
+        );
+        // hand-fixed unquoted form works only while the path is plain ASCII without spaces
+        assert_eq!(
+            classify_antigravity(&format!("{base} {p} -Source antigravity")),
+            Some(HandlerKind::Compatible)
+        );
+        let spaced = "C:/Users/John Smith/AppData/Local/KaiwenNotify/hooks/send-event.ps1";
+        assert_eq!(
+            classify_antigravity(&format!("{base} {spaced} -Source antigravity")),
+            Some(HandlerKind::Legacy)
+        );
+        let turkish = "C:/Users/Çağrı/AppData/Local/KaiwenNotify/hooks/send-event.ps1";
+        assert_eq!(
+            classify_antigravity(&format!("{base} {turkish} -Source antigravity")),
+            Some(HandlerKind::Legacy)
+        );
+    }
+
+    #[test]
+    fn foreign_commands_are_never_classified_as_ours() {
+        for cmd in [
+            "echo hi",
+            "powershell.exe -NoProfile -File C:/other/script.ps1 -Source antigravity",
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:/x/send-event.ps1 -Source antigravity",
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File C:/x/KaiwenNotify/hooks/send-event.ps1 -Source claude",
+            "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand AAAA",
+        ] {
+            assert_eq!(classify_antigravity(cmd), None, "{cmd}");
+        }
+    }
+
+    #[test]
+    fn antigravity_detection_reads_the_shared_group_only() {
+        let current = antigravity_command();
+        let root = json!({
+            "kaiwen-notify": {"enabled": true, "Stop": [
+                {"type":"command","command":"echo someone else"},
+                {"type":"command","command": current}]},
+            "kaiwen-temp-probe": {"PreInvocation": [{"type":"command","command": current}]}
+        });
+        assert_eq!(antigravity_kinds(&root), vec![HandlerKind::Current]);
+        assert!(antigravity_kinds(&json!({"other": {}})).is_empty());
+        assert!(antigravity_kinds(&serde_json::Value::Null).is_empty());
     }
 
     #[test]
