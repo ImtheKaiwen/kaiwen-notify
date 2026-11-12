@@ -3,6 +3,7 @@
   python scripts/release_tools.py check-versions <version>   all version fields agree and CHANGELOG has the section
   python scripts/release_tools.py notes <version>            GitHub release body (English)
   python scripts/release_tools.py verify-assets <tag> [repo] draft/published release has installer, .sig, latest.json and they agree
+  python scripts/release_tools.py finalize-manifest <tag> [repo]  replace draft api URLs in latest.json with public download URLs
   python scripts/release_tools.py verify-endpoint <repo>     the public updater endpoint serves a valid latest.json
 """
 import json
@@ -110,6 +111,26 @@ def verify_assets(tag, repo=REPO_DEFAULT):
     print(f'assets ok: {setup[0]} ({names[setup[0]]["size"]} bytes), {sigs[0]}, latest.json; draft={info["isDraft"]}')
 
 
+def finalize_manifest(tag, repo=REPO_DEFAULT):
+    """Draft releases make tauri-action write temporary api.github.com asset URLs into latest.json.
+    Rewrite them to the permanent public download URLs, then re-upload the manifest (still a draft)."""
+    version = tag.lstrip('v')
+    info = json.loads(run('gh', 'release', 'view', tag, '--repo', repo, '--json', 'assets'))
+    installers = [a['name'] for a in info['assets'] if a['name'].endswith('_x64-setup.exe')]
+    assert len(installers) == 1, installers
+    url = f'https://github.com/{repo}/releases/download/{tag}/{installers[0]}'
+    with tempfile.TemporaryDirectory() as tmp:
+        run('gh', 'release', 'download', tag, '--repo', repo, '--dir', tmp, '--pattern', 'latest.json')
+        path = Path(tmp) / 'latest.json'
+        manifest = json.loads(path.read_text(encoding='utf8'))
+        assert manifest['version'] == version, manifest['version']
+        for platform in manifest['platforms'].values():
+            platform['url'] = url
+        path.write_text(json.dumps(manifest, indent=2), encoding='utf8')
+        run('gh', 'release', 'upload', tag, str(path), '--repo', repo, '--clobber')
+    print('manifest urls ->', url)
+
+
 def verify_endpoint(repo=REPO_DEFAULT):
     url = f'https://github.com/{repo}/releases/latest/download/latest.json'
     with urllib.request.urlopen(url, timeout=30) as response:
@@ -126,7 +147,7 @@ def verify_endpoint(repo=REPO_DEFAULT):
 
 if __name__ == '__main__':
     command, *args = sys.argv[1:] or ['']
-    commands = {'check-versions': check_versions, 'notes': notes, 'verify-assets': verify_assets,
+    commands = {'check-versions': check_versions, 'notes': notes, 'verify-assets': verify_assets, 'finalize-manifest': finalize_manifest,
                 'verify-endpoint': verify_endpoint}
     if command not in commands:
         sys.exit(__doc__)
