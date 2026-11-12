@@ -94,6 +94,8 @@ jobs:
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
           args: --config src-tauri/tauri.release.conf.json
+      - name: Point latest.json at the permanent download URL
+        run: python scripts/release_tools.py finalize-manifest ${{ steps.meta.outputs.tag }} ${{ github.repository }}
       - name: Verify draft release assets
         run: python scripts/release_tools.py verify-assets ${{ steps.meta.outputs.tag }} ${{ github.repository }}
 
