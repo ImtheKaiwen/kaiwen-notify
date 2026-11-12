@@ -64,14 +64,16 @@ All paths come from the Windows environment (`USERPROFILE`, `LOCALAPPDATA`, Taur
 
 Short version (details, method and caveats in [docs/PERFORMANCE.md](docs/PERFORMANCE.md)):
 
-| Mode | v0.5.0 release build, one machine, see caveats |
+| Mode | v0.5.0 release build (3 runs, one laptop) |
 |---|---|
 | Installer size | 3.3 MB |
-| Tray only (no window) | see table below |
-| Window open | the app process plus six WebView2 processes; WebView2 dominates |
-| Idle CPU | about 0 over 30 s windows |
+| Tray only (window closed) | about 30 MB, 0 WebView2 processes, 0 CPU over 30 s |
+| Started with Launch at startup | about 14 MB (single observation) |
+| Window open | about 395 MB combined: app 30 MB plus 6 WebView2 processes (~365 MB) |
+| First window (splash) after launch | about 0.5 to 0.7 s; the main window follows after the ~2.4 s splash |
+| Idle CPU | 0 to 0.06 s over 30 s windows |
 
-These are measurements from one laptop (Windows 11, 12th-gen Core i5, 16 GB), not guarantees. The window-open number includes Microsoft's WebView2 processes, which are shared-runtime processes that Windows reports as separate working sets.
+These are measurements from one laptop (Windows 11 build 26200, Core i5-12450H, 16 GB), taken with `Get-Process` on an installed release build, not guarantees. The window-open number includes Microsoft's WebView2 processes, which are shared-runtime processes that Windows reports as separate working sets.
 
 ## Development
 

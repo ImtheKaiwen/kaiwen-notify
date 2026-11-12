@@ -125,7 +125,7 @@ def test_splash_cannot_hang_and_main_is_revealed_when_ready():
 def test_startup_modes():
     rust = read('src-tauri/src/lib.rs')
     assert '"--autostart"' in rust and '.args(["--autostart"])' in rust.replace('\n', '').replace('  ', '') or '--autostart' in rust
-    setup = rust[rust.index('let autostart ='):rust.index('start_udp_listener(app.handle().clone());')]
+    setup = rust[rust.index('let autostart ='):rust.index('start_update_scheduler(app.handle().clone());')]
     # autostart branch must not build a window or a splash
     auto_branch = setup[setup.index('if autostart {'):setup.index('} else if after_update')]
     assert 'build_main' not in auto_branch and 'open_splash' not in auto_branch
