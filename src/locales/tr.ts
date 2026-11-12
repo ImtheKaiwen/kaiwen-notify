@@ -58,6 +58,17 @@ export const tr: Dictionary = {
   'detail.skipped': 'Atlandı',
   'detail.waiting': 'Sırada',
 
+  'diag.title': 'Antigravity çalışma ortamları',
+  'diag.app': 'Masaüstü Uygulaması',
+  'diag.ide': 'IDE',
+  'diag.cli': 'CLI',
+  'diag.none': 'Henüz doğrulanmadı: hook çağrısı görülmedi',
+  'diag.verified': 'Doğrulandı · son bildirim {time}',
+  'diag.ranSilent': 'Hook {time} tarihinde çalıştı ama sessiz kaldı ({why})',
+  'diag.note.not_idle': 'arka plan görevleri hâlâ çalışıyordu',
+  'diag.note.stopped_early': 'çalışma erken bitti veya hatayla sonlandı',
+  'diag.hint': 'Yalnızca hook dosyasının bulunması çalışan bir bağlantı anlamına gelmez. Kurulumdan sonra Antigravity\'yi tamamen yeniden başlat ve bir görev bitir; her ortam, hook gerçekten çalıştığında doğrulanmış sayılır.',
+
   'sound.title': 'Bildirim sesi',
   'sound.defaultName': 'Kaiwen Varsayılan',
   'sound.defaultInfo': 'Yerleşik kısa bildirim sesi',

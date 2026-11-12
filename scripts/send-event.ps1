@@ -18,22 +18,55 @@ function Write-Diag([string]$Text) {
         }
     } catch { }
 }
+
+function Send-Udp([string]$Message) {
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Message)
+    $udp = New-Object System.Net.Sockets.UdpClient
+    try {
+        $udp.Connect('127.0.0.1', 47451)
+        [void]$udp.Send($bytes, $bytes.Length)
+    }
+    finally { $udp.Dispose() }
+}
+
+# Antigravity ships as three runtimes that share one hooks.json but keep separate data folders.
+# The Stop payload's transcriptPath reveals which one is calling: ~/.gemini/antigravity (Desktop App),
+# antigravity-ide (IDE) or antigravity-cli (CLI). Only the product name is reported, never the path.
+function Get-AntigravityProduct($Payload) {
+    $path = ([string]$Payload.transcriptPath).Replace('\', '/').ToLowerInvariant()
+    if ($path -match '/\.gemini/antigravity-ide/') { return 'ide' }
+    if ($path -match '/\.gemini/antigravity-cli/') { return 'cli' }
+    if ($path -match '/\.gemini/antigravity/') { return 'app' }
+    return $null
+}
+
 Write-Diag 'invoked'
 try {
+    $product = $null
     # Claude, Codex Stop hooks and Antigravity supply JSON via stdin.
     # Codex requires valid JSON on stdout, even when the app is unavailable.
     if ([Console]::IsInputRedirected) {
         $raw = [Console]::In.ReadToEnd()
         if (-not [string]::IsNullOrWhiteSpace($raw)) {
             $payload = try { $raw | ConvertFrom-Json } catch { Write-Diag 'payload not JSON'; $null }
-            Write-Diag ("payload fullyIdle=$($payload.fullyIdle) reason=$($payload.terminationReason) exec=$($payload.executionNum) bytes=$($raw.Length) keys=$(@($payload.PSObject.Properties.Name) -join ',')")
+            if ($Source -eq 'antigravity') { $product = Get-AntigravityProduct $payload }
+            Write-Diag ("payload product=$product fullyIdle=$($payload.fullyIdle) reason=$($payload.terminationReason) exec=$($payload.executionNum) bytes=$($raw.Length) keys=$(@($payload.PSObject.Properties.Name) -join ',')")
             if ($Source -eq 'antigravity') {
+                $suffix = if ($product) { ',"product":"' + $product + '"' } else { '' }
                 # Per the Stop contract fullyIdle=false means background tasks are still running.
-                if ($payload.fullyIdle -eq $false) { Write-Diag 'skip: fullyIdle=false'; return }
+                if ($payload.fullyIdle -eq $false) {
+                    Write-Diag 'skip: fullyIdle=false'
+                    Send-Udp ('{"source":"antigravity","kind":"seen","note":"not_idle"' + $suffix + '}')
+                    return
+                }
                 # Documented reasons are examples, not an exhaustive list, so skip only known non-completions
                 # instead of requiring one exact success string.
                 $reason = [string]$payload.terminationReason
-                if ($reason -in 'error', 'max_steps_exceeded', 'cancelled', 'canceled', 'user_cancelled') { Write-Diag "skip: reason=$reason"; return }
+                if ($reason -in 'error', 'max_steps_exceeded', 'cancelled', 'canceled', 'user_cancelled') {
+                    Write-Diag "skip: reason=$reason"
+                    Send-Udp ('{"source":"antigravity","kind":"seen","note":"stopped_early"' + $suffix + '}')
+                    return
+                }
             }
             if ($Source -eq 'claude' -and $payload.stop_hook_active -eq $true) { return }
         }
@@ -42,14 +75,12 @@ try {
     else { Write-Diag 'stdin not redirected' }
 
     Write-Diag 'sending'
-    $message = '{"source":"' + $Source + '","kind":"completed"}'
-    $bytes = [Text.Encoding]::UTF8.GetBytes($message)
-    $udp = New-Object System.Net.Sockets.UdpClient
-    try {
-        $udp.Connect('127.0.0.1', 47451)
-        [void]$udp.Send($bytes, $bytes.Length)
+    if ($Source -eq 'antigravity' -and $product) {
+        Send-Udp ('{"source":"antigravity","kind":"completed","product":"' + $product + '"}')
     }
-    finally { $udp.Dispose() }
+    else {
+        Send-Udp ('{"source":"' + $Source + '","kind":"completed"}')
+    }
 }
 catch {
     # Never fail an agent turn because the notification app is closed.

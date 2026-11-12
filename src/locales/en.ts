@@ -57,6 +57,17 @@ export const en = {
   'detail.skipped': 'Skipped',
   'detail.waiting': 'Waiting',
 
+  'diag.title': 'Antigravity runtimes',
+  'diag.app': 'Desktop App',
+  'diag.ide': 'IDE',
+  'diag.cli': 'CLI',
+  'diag.none': 'Not verified yet: no hook call seen',
+  'diag.verified': 'Verified · last notification {time}',
+  'diag.ranSilent': 'Hook ran {time}, but stayed silent ({why})',
+  'diag.note.not_idle': 'background tasks were still running',
+  'diag.note.stopped_early': 'the run ended early or with an error',
+  'diag.hint': 'A hook file alone does not prove a working connection. Fully restart Antigravity after installing, then finish one task; each runtime is marked verified once its hook has really run.',
+
   'sound.title': 'Notification sound',
   'sound.defaultName': 'Kaiwen Default',
   'sound.defaultInfo': 'Built-in short chime',

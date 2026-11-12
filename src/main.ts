@@ -6,7 +6,8 @@ import { errorText, onLanguageChange, resolveLanguage, setLanguage, t, language 
 import type { Key } from './locales/en';
 
 type Theme = 'system' | 'light' | 'dark';
-type Settings = { enabled: boolean; sound_path: string; theme: Theme; auto_update: boolean; last_update_check: number; language: string };
+type ProductSeen = { last_seen: number; last_completed: number; last_note: string | null };
+type Settings = { antigravity: Record<string, ProductSeen>; enabled: boolean; sound_path: string; theme: Theme; auto_update: boolean; last_update_check: number; language: string };
 type NotificationEvent = { source: string; timestamp: number };
 type Status = { settings: Settings; system_language: string; received: number; listener_ok: boolean; last_event: NotificationEvent | null };
 type ProviderId = 'claude' | 'codex' | 'antigravity';
@@ -148,6 +149,7 @@ function providerRow(id: ProviderId): HTMLLIElement {
 }
 
 function renderProviders() {
+  queueMicrotask(renderAntigravityDiag);
   for (const id of ['setup-providers', 'dash-providers']) {
     el(id).replaceChildren(...PROVIDERS.map((p) => providerRow(p.id)));
   }
@@ -225,6 +227,33 @@ function presentSound(path: string) {
   el('sound-name').textContent = path ? (path.split(/[\\/]/).pop() ?? path) : t('sound.defaultName');
   el('sound-info').textContent = path ? t('sound.customInfo') : t('sound.defaultInfo');
 }
+/** Per-runtime proof that Antigravity really ran our hook; a hook file alone is never shown as success. */
+function renderAntigravityDiag() {
+  const box = el('antigravity-diag');
+  const state = reports.find((r) => r.id === 'antigravity')?.state;
+  box.hidden = !(state === 'connected' || state === 'repair_required');
+  if (box.hidden) return;
+  const when = (ms: number) => new Date(ms).toLocaleString(t('time.locale'));
+  const rows = (['app', 'ide', 'cli'] as const).map((key) => {
+    const seen = settings?.antigravity?.[key];
+    const row = document.createElement('div');
+    row.className = 'diag-row';
+    const who = Object.assign(document.createElement('span'), { className: 'who', textContent: t(`diag.${key}` as Key) });
+    const what = document.createElement('span');
+    what.className = 'what';
+    if (!seen || seen.last_seen === 0) what.textContent = t('diag.none');
+    else if (seen.last_completed > 0 && !seen.last_note) { what.textContent = t('diag.verified', { time: when(seen.last_completed) }); what.classList.add('ok'); }
+    else {
+      const why = seen.last_note ? t(`diag.note.${seen.last_note}` as Key) : '';
+      what.textContent = t('diag.ranSilent', { time: when(seen.last_seen), why });
+    }
+    row.append(who, what);
+    return row;
+  });
+  const title = Object.assign(document.createElement('h3'), { textContent: t('diag.title') });
+  const hint = Object.assign(document.createElement('p'), { className: 'note', textContent: t('diag.hint') });
+  box.replaceChildren(title, ...rows, hint);
+}
 function renderStatus() {
   if (!status || !settings) return;
   presentSound(settings.sound_path);
@@ -235,6 +264,7 @@ function renderStatus() {
   el('last-event').textContent = status.last_event
     ? t('status.last', { source: status.last_event.source, time: new Date(status.last_event.timestamp).toLocaleTimeString(t('time.locale')) })
     : t('status.none');
+  renderAntigravityDiag();
   el('auto-update-desc').textContent = t('settings.autoUpdateDesc', { n: update?.interval_minutes ?? 10 });
 }
 function applyStatus(next: Status) {
@@ -369,6 +399,7 @@ updateBtn.addEventListener('click', () => { void updateAction(); });
 /* ---------- events (registered once; Rust only emits when something happens) ---------- */
 onLanguageChange(() => { renderProviders(); renderStatus(); renderUpdate(); });
 void listen<NotificationEvent>('notify-event', () => { void reload(); });
+void listen<string>('hook-seen', () => { void reload(); });
 void listen<Progress>('integration-progress', (e) => {
   live.set(e.payload.provider, e.payload);
   renderProviders();

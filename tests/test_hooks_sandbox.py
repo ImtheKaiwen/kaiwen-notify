@@ -244,3 +244,23 @@ def test_only_detected_provider_missing_tools_do_not_break_install(profile):
     assert not (home / '.codex').exists() and not (home / '.gemini').exists()
     run('uninstall-hooks.ps1', home, local)  # nothing to remove elsewhere: still succeeds
     assert count_ours((home / '.claude' / 'settings.json').read_text('utf8')) == 0
+
+
+# ---- Antigravity App / IDE / CLI are told apart by their data folder ---------------------------
+@pytest.mark.parametrize('folder,product', [
+    ('antigravity', 'app'), ('antigravity-ide', 'ide'), ('antigravity-cli', 'cli')])
+def test_antigravity_product_detected_from_transcript_path(folder, product):
+    payload = {**STOP_BASE, 'terminationReason': 'model_stop', 'fullyIdle': True,
+               'transcriptPath': f'C:/Users/Someone Else/.gemini/{folder}/brain/abc/.system_generated/logs/transcript.jsonl'}
+    got, result = invoke_bridge('antigravity', json.dumps(payload), None)
+    assert json.loads(result.stdout.strip()) == {'decision': 'stop'}
+    assert got == [('{"source":"antigravity","kind":"completed","product":"%s"}' % product).encode()], got
+    assert b'Someone' not in b''.join(got), 'no paths or user names leave the hook'
+
+
+def test_antigravity_not_idle_reports_a_silent_seen_event():
+    payload = {**STOP_BASE, 'terminationReason': 'model_stop', 'fullyIdle': False,
+               'transcriptPath': 'C:/Users/x/.gemini/antigravity/brain/a/.system_generated/logs/transcript.jsonl'}
+    got, result = invoke_bridge('antigravity', json.dumps(payload), None)
+    assert got == [b'{"source":"antigravity","kind":"seen","note":"not_idle","product":"app"}'], got
+    assert json.loads(result.stdout.strip()) == {'decision': 'stop'}

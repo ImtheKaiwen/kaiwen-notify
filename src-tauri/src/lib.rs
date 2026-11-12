@@ -43,6 +43,8 @@ struct Settings {
     /// system | en | tr
     #[serde(default = "system_theme")]
     language: String,
+    /// Per Antigravity runtime (`app`, `ide`, `cli`): proof the hook really ran.
+    antigravity: HashMap<String, ProductSeen>,
 }
 fn yes() -> bool {
     true
@@ -60,6 +62,7 @@ impl Settings {
             auto_update: true,
             last_update_check: 0,
             language: system_theme(),
+            antigravity: HashMap::new(),
         }
     }
 }
@@ -85,6 +88,56 @@ struct Status {
 struct HookEvent {
     source: Source,
     kind: Kind,
+    /// Antigravity only: which runtime called the hook (App/IDE/CLI share one hooks.json).
+    #[serde(default)]
+    product: Option<Product>,
+    /// Antigravity `seen` events: why no sound was played.
+    #[serde(default)]
+    note: Option<Note>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+enum Product {
+    App,
+    Ide,
+    Cli,
+}
+impl Product {
+    fn key(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Ide => "ide",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+enum Note {
+    NotIdle,
+    StoppedEarly,
+}
+impl Note {
+    fn key(self) -> &'static str {
+        match self {
+            Self::NotIdle => "not_idle",
+            Self::StoppedEarly => "stopped_early",
+        }
+    }
+}
+
+/// Evidence that a real Antigravity runtime executed our hook (file presence alone proves nothing).
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ProductSeen {
+    /// Unix millis of the last hook invocation (any outcome).
+    last_seen: u64,
+    /// Unix millis of the last invocation that produced a notification.
+    last_completed: u64,
+    /// Why the last invocation stayed silent, if it did.
+    last_note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +161,7 @@ impl Source {
 #[serde(rename_all = "lowercase")]
 enum Kind {
     Completed,
+    Seen,
 }
 
 struct AppState {
@@ -446,6 +500,17 @@ fn start_udp_listener(app: tauri::AppHandle) {
                 continue;
             };
             let source = event.source.label();
+            if let (Source::Antigravity, Some(product)) = (&event.source, event.product) {
+                record_antigravity(
+                    &app,
+                    product,
+                    matches!(event.kind, Kind::Completed),
+                    event.note,
+                );
+            }
+            if matches!(event.kind, Kind::Seen) {
+                continue; // diagnostics only, never a sound
+            }
             let now = Instant::now();
             if recent
                 .get(source)
@@ -470,6 +535,27 @@ fn start_udp_listener(app: tauri::AppHandle) {
             let _ = app.emit("notify-event", detail);
         }
     });
+}
+
+fn record_antigravity(
+    app: &tauri::AppHandle,
+    product: Product,
+    completed: bool,
+    note: Option<Note>,
+) {
+    let state = app.state::<AppState>();
+    let now = now_millis();
+    let _ = update_settings(&state, |s| {
+        let entry = s.antigravity.entry(product.key().to_string()).or_default();
+        entry.last_seen = now;
+        if completed {
+            entry.last_completed = now;
+            entry.last_note = None;
+        } else {
+            entry.last_note = note.map(|n| n.key().to_string());
+        }
+    });
+    let _ = app.emit("hook-seen", product.key());
 }
 
 fn start_update_scheduler(app: tauri::AppHandle) {
