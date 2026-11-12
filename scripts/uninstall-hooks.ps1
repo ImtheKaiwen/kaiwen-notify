@@ -38,12 +38,29 @@ function Commit-Json([string]$Path, $Object, [string]$Description) {
     Write-Host $Description
 }
 
+# ---- Antigravity hook command (single contract; keep in sync with src-tauri/src/integrations.rs) ----
+# Antigravity passes the quotes of a quoted `-File "path"` argument through to PowerShell, which then fails with
+# "invalid characters in path". An -EncodedCommand has no spaces or quotes at all, and the script path is
+# resolved at run time from %LOCALAPPDATA%, so the identical command works for every Windows user name/path.
+$AntigravityScriptText = @'
+$ProgressPreference = 'SilentlyContinue'; $d = $env:LOCALAPPDATA; if (-not $d) { $d = [Environment]::GetFolderPath('LocalApplicationData') }; & (Join-Path $d 'KaiwenNotify\hooks\send-event.ps1') -Source antigravity
+'@
+$AntigravityCommand = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand ' +
+    [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($AntigravityScriptText))
+# Returns 'current' (this contract), 'compatible' (older unquoted -File form that works because the path has no
+# spaces/non-ASCII characters), 'legacy' (older quoted forms that fail under Antigravity) or $null (not ours).
+function Get-AntigravityHandlerKind($Handler) {
+    if ($null -eq $Handler -or -not (Has-Property $Handler 'command') -or $Handler.type -ne 'command') { return $null }
+    $cmd = [string]$Handler.command
+    if ($cmd -ceq $AntigravityCommand) { return 'current' }
+    $m = [regex]::Match($cmd, '^powershell\.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ("?)([^"]*KaiwenNotify[\\/]hooks[\\/]send-event\.ps1)\1 -Source antigravity$')
+    if (-not $m.Success) { return $null }
+    if ($m.Groups[1].Value -eq '' -and $m.Groups[2].Value -cmatch '^[\x21-\x7E]+$') { return 'compatible' }
+    return 'legacy'
+}
+
 $hookScript = Join-Path $env:LOCALAPPDATA 'KaiwenNotify\hooks\send-event.ps1'
 $claudeExpected = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript + '" -Source claude'
-$antiExpected = @(
-    ('powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript + '" -Source antigravity'),
-    ('powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript.Replace('\', '/') + '" -Source antigravity')
-)
 
 if ($Provider -in 'all','claude') {
 # Claude Code: remove only the exact command handler from Stop groups.
@@ -93,7 +110,7 @@ if (Test-Path -LiteralPath $claudePath) {
 }
 
 if ($Provider -in 'all','antigravity') {
-# Antigravity: remove its own named group only when the exact command matches.
+# Antigravity: remove only our own handlers (every known command form) from our named group.
 $antiPath = Join-Path $env:USERPROFILE '.gemini\config\hooks.json'
 if (Test-Path -LiteralPath $antiPath) {
     $anti = Read-JsonObject $antiPath
@@ -102,7 +119,7 @@ if (Test-Path -LiteralPath $antiPath) {
         if (Has-Property $group 'Stop') {
             $originalHandlers = @($group.Stop | Where-Object { $null -ne $_ })
             $others = @($originalHandlers | Where-Object {
-                -not ((Has-Property $_ 'command') -and $antiExpected -ccontains $_.command -and $_.type -eq 'command')
+                $null -eq (Get-AntigravityHandlerKind $_)
             })
             $removed = $originalHandlers.Count - $others.Count
             if ($removed -gt 0) {

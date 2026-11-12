@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+- Fixed Antigravity Desktop hook execution on Windows. Antigravity passes the quotes around a `-File "path"` argument through to PowerShell, which then failed with "invalid characters in path" (confirmed in the Antigravity language server log). The hook is now a single `-EncodedCommand` that contains no quotes or spaces and resolves the bridge script from `%LOCALAPPDATA%` at run time, so it works for every Windows user name and profile path, including paths with spaces and non-ASCII characters.
+- Improved detection and migration of previously installed notification hooks. The three earlier forms (v0.4 quoted backslashes, v0.5.0 quoted forward slashes, a hand-fixed unquoted command) are recognised: broken ones show **Repair required** and are upgraded in place by Install/Repair; a working unquoted command on a plain path is left alone; duplicates collapse to one handler; uninstall removes every known form and nothing else. Other hooks in the shared file are never touched and a backup is made before each edit.
+- The hook bridge script is refreshed automatically after an app update, so bridge fixes reach existing installs without pressing Repair.
+- Preserved Antigravity IDE, CLI, Claude Code and Codex compatibility (their commands are unchanged; Codex's `notify` setting is still never touched).
+
+### Notes
+- The opt-in diagnostic log (`diag.enabled`) now rolls over at 256 KB. It is still off by default.
+- Verification status: the Antigravity **Desktop App** was verified on a real Windows task with the unquoted command (maintainer log: payload `product=app fullyIdle=True reason=NO_TOOL_CALL`). The final encoded command is covered by automated tests under several launchers and unusual profile paths; its real-Desktop confirmation is recorded in the release notes. **IDE and CLI real tasks are not verified.**
+
 ## 0.5.0
 
 ### Added
