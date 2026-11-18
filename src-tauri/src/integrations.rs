@@ -482,24 +482,109 @@ impl SubagentMode {
     }
 }
 
-/// Registers or removes the SubagentStop hook for connected providers that support it. Antigravity is never
-/// touched. Idempotent; backups are made by the script before any edit.
-pub fn sync_subagent_hooks(scripts_dir: &Path, enabled: bool) -> Result<(), String> {
-    write_scripts(scripts_dir)?;
+/// Raw copy of a provider's config file, used to restore it exactly if a multi-provider change fails halfway.
+type Snapshot = Option<Vec<u8>>;
+
+/// The side effects of toggling the SubagentStop hook, separated so partial failures can be tested.
+trait HookOps {
+    fn connected(&self, provider: Provider) -> bool;
+    fn is_on(&self, provider: Provider) -> bool;
+    fn snapshot(&self, provider: Provider) -> Result<Snapshot, String>;
+    fn apply(&mut self, provider: Provider, on: bool) -> Result<(), String>;
+    fn restore(&mut self, provider: Provider, snapshot: &Snapshot) -> Result<(), String>;
+}
+
+/// Error code when a change failed and everything was put back as it was.
+pub const E_HOOKS_UNCHANGED: &str = "E_SUBAGENT_HOOKS";
+/// Prefix of the error code when a change failed AND undoing it failed too: `E_SUBAGENT_ROLLBACK:claude,codex`
+/// lists the providers whose real state is unknown.
+pub const E_HOOKS_INCONSISTENT: &str = "E_SUBAGENT_ROLLBACK";
+
+/// Applies the hook change provider by provider. If any step fails, the providers already changed (and the one
+/// that failed, which may be half written) are restored from their snapshots. Rollback failures are reported
+/// by name, never hidden. Providers already in the wanted state are not touched, so the call is repeatable.
+fn sync_with(ops: &mut dyn HookOps, enabled: bool) -> Result<(), String> {
+    let mut done: Vec<(Provider, Snapshot)> = Vec::new();
     for provider in ALL {
-        if provider == Provider::Antigravity {
+        if provider == Provider::Antigravity || !ops.connected(provider) {
+            continue; // never touched / never install a Stop hook as a side effect
+        }
+        if ops.is_on(provider) == enabled {
             continue;
         }
-        let state = detect_one(provider)?.state;
-        // Only providers that are already connected: never install a Stop hook as a side effect.
-        if matches!(
-            state,
-            ProviderState::Connected | ProviderState::RepairRequired
-        ) {
-            run_script(scripts_dir, true, provider, SubagentMode::OnlySet(enabled))?;
+        let step = ops.snapshot(provider).and_then(|snapshot| {
+            // recorded before the change: the provider that fails may be half written and needs restoring too
+            done.push((provider, snapshot));
+            ops.apply(provider, enabled)
+        });
+        if let Err(error) = step {
+            let mut stuck: Vec<&'static str> = Vec::new();
+            for (changed, saved) in done.iter().rev() {
+                if ops.restore(*changed, saved).is_err() {
+                    stuck.push(changed.id());
+                }
+            }
+            return Err(if stuck.is_empty() {
+                format!("{E_HOOKS_UNCHANGED}:{error}")
+            } else {
+                stuck.reverse();
+                format!("{E_HOOKS_INCONSISTENT}:{}", stuck.join(","))
+            });
         }
     }
     Ok(())
+}
+
+struct RealHookOps<'a> {
+    scripts_dir: &'a Path,
+}
+
+impl HookOps for RealHookOps<'_> {
+    fn connected(&self, provider: Provider) -> bool {
+        matches!(
+            detect_one(provider).map(|r| r.state),
+            Ok(ProviderState::Connected | ProviderState::RepairRequired)
+        )
+    }
+    fn is_on(&self, provider: Provider) -> bool {
+        subagent_state(provider) == "ready"
+    }
+    fn snapshot(&self, provider: Provider) -> Result<Snapshot, String> {
+        let file = provider.config_file(&home_dir()?);
+        match fs::read(&file) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+    fn apply(&mut self, provider: Provider, on: bool) -> Result<(), String> {
+        run_script(self.scripts_dir, true, provider, SubagentMode::OnlySet(on))
+    }
+    fn restore(&mut self, provider: Provider, snapshot: &Snapshot) -> Result<(), String> {
+        let file = provider.config_file(&home_dir()?);
+        match snapshot {
+            None => match fs::remove_file(&file) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            },
+            Some(bytes) => {
+                let tmp = file.with_extension("kaiwen-restore.tmp");
+                fs::write(&tmp, bytes).map_err(|e| e.to_string())?;
+                fs::rename(&tmp, &file).map_err(|e| {
+                    let _ = fs::remove_file(&tmp);
+                    e.to_string()
+                })
+            }
+        }
+    }
+}
+
+/// Registers or removes the SubagentStop hook for connected providers that support it. Antigravity is never
+/// touched. Idempotent. All-or-nothing: on a partial failure the already changed providers are restored; see
+/// `sync_with` for the error codes.
+pub fn sync_subagent_hooks(scripts_dir: &Path, enabled: bool) -> Result<(), String> {
+    write_scripts(scripts_dir)?;
+    sync_with(&mut RealHookOps { scripts_dir }, enabled)
 }
 
 pub fn run_operation(
@@ -719,6 +804,133 @@ mod tests {
         ));
     }
 
+    #[derive(Default)]
+    struct Fake {
+        state: std::collections::HashMap<&'static str, (bool, bool, Vec<u8>)>, // connected, on, file
+        fail_apply: Option<&'static str>,
+        fail_restore: Vec<&'static str>,
+        applied: Vec<(&'static str, bool)>,
+    }
+
+    impl Fake {
+        fn with(claude_on: bool, codex_on: bool) -> Self {
+            let mut fake = Self::default();
+            fake.state
+                .insert("claude", (true, claude_on, b"claude-0".to_vec()));
+            fake.state
+                .insert("codex", (true, codex_on, b"codex-0".to_vec()));
+            fake.state
+                .insert("antigravity", (true, false, b"anti-0".to_vec()));
+            fake
+        }
+    }
+
+    impl HookOps for Fake {
+        fn connected(&self, p: Provider) -> bool {
+            self.state[p.id()].0
+        }
+        fn is_on(&self, p: Provider) -> bool {
+            self.state[p.id()].1
+        }
+        fn snapshot(&self, p: Provider) -> Result<Snapshot, String> {
+            Ok(Some(self.state[p.id()].2.clone()))
+        }
+        fn apply(&mut self, p: Provider, on: bool) -> Result<(), String> {
+            self.applied.push((p.id(), on));
+            let entry = self.state.get_mut(p.id()).unwrap();
+            entry.2.extend_from_slice(b"-half-written");
+            if self.fail_apply == Some(p.id()) {
+                return Err("E_SCRIPT:boom".into());
+            }
+            entry.1 = on;
+            Ok(())
+        }
+        fn restore(&mut self, p: Provider, snapshot: &Snapshot) -> Result<(), String> {
+            if self.fail_restore.contains(&p.id()) {
+                return Err("denied".into());
+            }
+            let entry = self.state.get_mut(p.id()).unwrap();
+            entry.2 = snapshot.clone().unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sync_changes_both_providers_and_never_antigravity() {
+        let mut fake = Fake::with(false, false);
+        sync_with(&mut fake, true).unwrap();
+        assert_eq!(fake.applied, vec![("claude", true), ("codex", true)]);
+        sync_with(&mut fake, true).unwrap(); // repeat is a no-op (idempotent)
+        assert_eq!(fake.applied.len(), 2);
+    }
+
+    #[test]
+    fn sync_skips_providers_that_are_not_connected() {
+        let mut fake = Fake::with(false, false);
+        fake.state.get_mut("codex").unwrap().0 = false;
+        sync_with(&mut fake, true).unwrap();
+        assert_eq!(fake.applied, vec![("claude", true)]);
+    }
+
+    #[test]
+    fn failure_of_the_second_provider_restores_the_first_and_itself() {
+        let mut fake = Fake::with(true, true); // turning off: claude succeeds, codex fails
+        fake.fail_apply = Some("codex");
+        let error = sync_with(&mut fake, false).unwrap_err();
+        assert!(error.starts_with(E_HOOKS_UNCHANGED), "{error}");
+        assert_eq!(fake.state["claude"].2, b"claude-0", "claude restored");
+        assert_eq!(
+            fake.state["codex"].2, b"codex-0",
+            "half-written codex restored"
+        );
+    }
+
+    #[test]
+    fn failure_of_the_first_provider_changes_nothing_else() {
+        let mut fake = Fake::with(false, false);
+        fake.fail_apply = Some("claude");
+        assert!(sync_with(&mut fake, true)
+            .unwrap_err()
+            .starts_with(E_HOOKS_UNCHANGED));
+        assert_eq!(
+            fake.applied,
+            vec![("claude", true)],
+            "codex was never attempted"
+        );
+        assert_eq!(fake.state["claude"].2, b"claude-0");
+        assert_eq!(fake.state["codex"].2, b"codex-0");
+    }
+
+    #[test]
+    fn failed_rollback_is_reported_by_provider() {
+        let mut fake = Fake::with(true, true);
+        fake.fail_apply = Some("codex");
+        fake.fail_restore = vec!["claude"];
+        assert_eq!(
+            sync_with(&mut fake, false).unwrap_err(),
+            "E_SUBAGENT_ROLLBACK:claude"
+        );
+        assert!(
+            !fake.state["claude"].1,
+            "claude really is off, and the error says so"
+        );
+        assert_eq!(
+            fake.state["codex"].2, b"codex-0",
+            "codex was still restored"
+        );
+    }
+
+    #[test]
+    fn total_rollback_failure_lists_every_provider() {
+        let mut fake = Fake::with(true, true);
+        fake.fail_apply = Some("codex");
+        fake.fail_restore = vec!["claude", "codex"];
+        assert_eq!(
+            sync_with(&mut fake, false).unwrap_err(),
+            "E_SUBAGENT_ROLLBACK:claude,codex"
+        );
+    }
+
     #[test]
     fn busy_guard_is_exclusive_and_releases() {
         let flag = AtomicBool::new(false);
@@ -818,6 +1030,96 @@ mod tests {
             detect_one(Provider::Claude).unwrap().state,
             ProviderState::Available
         );
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().subagent,
+            "hook_missing"
+        );
+
+        // ---- partial failure with the real scripts: Claude succeeds, Codex fails -------------------------
+        run_script(&scripts, true, Provider::Claude, SubagentMode::Keep).unwrap();
+        let claude_file = home.join(".claude/settings.json");
+        let codex_file = home.join(".codex/hooks.json");
+        let mut claude_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&claude_file).unwrap()).unwrap();
+        claude_json["hooks"]["SubagentStop"] =
+            json!([{"hooks": [{"type": "command", "command": "echo theirs"}]}]);
+        fs::write(
+            &claude_file,
+            serde_json::to_vec_pretty(&claude_json).unwrap(),
+        )
+        .unwrap();
+        let (claude_before, codex_before) = (
+            fs::read(&claude_file).unwrap(),
+            fs::read(&codex_file).unwrap(),
+        );
+        struct FailCodex<'a>(RealHookOps<'a>, bool);
+        impl HookOps for FailCodex<'_> {
+            fn connected(&self, p: Provider) -> bool {
+                self.0.connected(p)
+            }
+            fn is_on(&self, p: Provider) -> bool {
+                self.0.is_on(p)
+            }
+            fn snapshot(&self, p: Provider) -> Result<Snapshot, String> {
+                self.0.snapshot(p)
+            }
+            fn apply(&mut self, p: Provider, on: bool) -> Result<(), String> {
+                if p == Provider::Codex {
+                    return Err("E_SCRIPT:codex failed".into());
+                }
+                self.0.apply(p, on)
+            }
+            fn restore(&mut self, p: Provider, s: &Snapshot) -> Result<(), String> {
+                if self.1 && p == Provider::Claude {
+                    return Err("locked".into());
+                }
+                self.0.restore(p, s)
+            }
+        }
+        // rollback works: both files come back byte for byte, third-party hook included
+        let error = sync_with(
+            &mut FailCodex(
+                RealHookOps {
+                    scripts_dir: &scripts,
+                },
+                false,
+            ),
+            true,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("E_SUBAGENT_HOOKS:"), "{error}");
+        assert_eq!(fs::read(&claude_file).unwrap(), claude_before);
+        assert_eq!(fs::read(&codex_file).unwrap(), codex_before);
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().subagent,
+            "hook_missing"
+        );
+        // rollback fails too: the real state is reported, not hidden
+        let error = sync_with(
+            &mut FailCodex(
+                RealHookOps {
+                    scripts_dir: &scripts,
+                },
+                true,
+            ),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(error, "E_SUBAGENT_ROLLBACK:claude");
+        assert_eq!(detect_one(Provider::Claude).unwrap().subagent, "ready");
+        assert_eq!(
+            detect_one(Provider::Codex).unwrap().subagent,
+            "hook_missing"
+        );
+        assert!(fs::read_to_string(&claude_file)
+            .unwrap()
+            .contains("echo theirs"));
+        // a later normal sync repairs it, and turning it off keeps the third-party hook
+        sync_subagent_hooks(&scripts, true).unwrap();
+        sync_subagent_hooks(&scripts, false).unwrap();
+        assert!(fs::read_to_string(&claude_file)
+            .unwrap()
+            .contains("echo theirs"));
         assert_eq!(
             detect_one(Provider::Claude).unwrap().subagent,
             "hook_missing"

@@ -26,13 +26,20 @@ pub enum Verdict {
     Skip(&'static str),
 }
 
+/// Priority and merge state of one provider. Providers never share it: a Claude Code main sound must not
+/// silence a Codex sub-agent, and sub-agents of different providers are never merged into one sound.
+#[derive(Default)]
+struct Lane {
+    last_main: Option<Instant>,
+    main_until: Option<Instant>,
+    sub_until: Option<Instant>,
+}
+
 #[derive(Default)]
 pub struct Gate {
     by_id: HashMap<String, Instant>,
     by_kind: HashMap<(Provider, Category), Instant>,
-    last_main: Option<Instant>,
-    main_until: Option<Instant>,
-    sub_until: Option<Instant>,
+    lanes: HashMap<Provider, Lane>,
 }
 
 impl Gate {
@@ -42,6 +49,8 @@ impl Gate {
             return Verdict::Skip("unknown");
         }
         self.by_id
+            .retain(|_, seen| now.duration_since(*seen) < PRUNE_AFTER);
+        self.by_kind
             .retain(|_, seen| now.duration_since(*seen) < PRUNE_AFTER);
 
         if let Some(key) = &event.dedupe_key {
@@ -60,28 +69,24 @@ impl Gate {
             return Verdict::Skip("duplicate");
         }
 
-        match event.category {
-            Category::SubagentComplete => {
-                if self.main_until.is_some_and(|until| until > now)
-                    || self
-                        .last_main
-                        .is_some_and(|at| now.duration_since(at) < MAIN_GUARD)
-                {
-                    self.remember(event, now); // still the same event if it is redelivered
-                    return Verdict::Skip("main_priority");
-                }
-                if self.sub_until.is_some_and(|until| until > now) {
-                    self.remember(event, now);
-                    return Verdict::Skip("merged");
-                }
+        let lane = self.lanes.entry(event.provider).or_default();
+        if event.category == Category::SubagentComplete {
+            if lane.main_until.is_some_and(|until| until > now)
+                || lane
+                    .last_main
+                    .is_some_and(|at| now.duration_since(at) < MAIN_GUARD)
+            {
+                self.remember(event, now); // still the same event if it is redelivered
+                return Verdict::Skip("main_priority");
             }
-            Category::MainComplete | Category::Unknown => {}
+            if lane.sub_until.is_some_and(|until| until > now) {
+                self.remember(event, now);
+                return Verdict::Skip("merged");
+            }
+            // Reserve the slot immediately: sub-agents finishing during the queue delay merge into this one.
+            lane.sub_until = Some(now + SUBAGENT_DELAY + Duration::from_millis(550));
         }
         self.remember(event, now);
-        if event.category == Category::SubagentComplete {
-            // Reserve the slot immediately: sub-agents finishing during the queue delay merge into this one.
-            self.sub_until = Some(now + SUBAGENT_DELAY + Duration::from_millis(550));
-        }
         Verdict::Play
     }
 
@@ -92,22 +97,28 @@ impl Gate {
         self.by_kind.insert((event.provider, event.category), now);
     }
 
-    /// Call when a main sound starts: it takes priority over any sub-agent sound.
-    pub fn main_started(&mut self, now: Instant, sound: Duration) {
-        self.last_main = Some(now);
-        self.main_until = Some(now + sound + Duration::from_millis(300));
-        self.sub_until = None; // a sub-agent sound still playing is interrupted by the main one
+    /// Call when a main sound starts: it takes priority over this provider's sub-agent sounds only.
+    pub fn main_started(&mut self, provider: Provider, now: Instant, sound: Duration) {
+        let lane = self.lanes.entry(provider).or_default();
+        lane.last_main = Some(now);
+        lane.main_until = Some(now + sound + Duration::from_millis(300));
+        lane.sub_until = None; // its own sub-agent sound still playing is interrupted by the main one
     }
 
-    /// Call when a sub-agent sound starts: further sub-agent completions during it are merged into it.
-    pub fn subagent_started(&mut self, now: Instant, sound: Duration) {
-        self.sub_until =
+    /// Call when a sub-agent sound starts: further sub-agent completions of the same provider during it merge.
+    pub fn subagent_started(&mut self, provider: Provider, now: Instant, sound: Duration) {
+        self.lanes.entry(provider).or_default().sub_until =
             Some(now + sound.max(Duration::from_millis(400)) + Duration::from_millis(150));
     }
 
-    /// After `SUBAGENT_DELAY`, is a queued sub-agent sound still wanted? Not if a main sound started meanwhile.
-    pub fn subagent_still_wanted(&self, queued_at: Instant) -> bool {
-        !self.last_main.is_some_and(|at| at >= queued_at)
+    /// After `SUBAGENT_DELAY`, is a queued sub-agent sound still wanted? Not if a main sound of the same
+    /// provider started meanwhile.
+    pub fn subagent_still_wanted(&self, provider: Provider, queued_at: Instant) -> bool {
+        !self
+            .lanes
+            .get(&provider)
+            .and_then(|lane| lane.last_main)
+            .is_some_and(|at| at >= queued_at)
     }
 }
 
@@ -204,7 +215,7 @@ mod tests {
             )
         };
         assert_eq!(gate.decide(&sub("a"), t), Verdict::Play);
-        gate.subagent_started(t, SOUND);
+        gate.subagent_started(Provider::Claude, t, SOUND);
         for (i, id) in ["b", "c", "d", "e"].iter().enumerate() {
             let at = t + Duration::from_millis(40 * (i as u64 + 1));
             assert_eq!(gate.decide(&sub(id), at), Verdict::Skip("merged"), "{id}");
@@ -226,7 +237,7 @@ mod tests {
             Some("claude|s|p1"),
         );
         assert_eq!(gate.decide(&main, t), Verdict::Play);
-        gate.main_started(t, SOUND);
+        gate.main_started(Provider::Claude, t, SOUND);
         let sub = event(
             Provider::Claude,
             Category::SubagentComplete,
@@ -271,7 +282,10 @@ mod tests {
             Some("claude|s||a"),
         );
         assert_eq!(gate.decide(&sub, t), Verdict::Play);
-        assert!(gate.subagent_still_wanted(t), "nothing else happened");
+        assert!(
+            gate.subagent_still_wanted(Provider::Claude, t),
+            "nothing else happened"
+        );
         // the main completion arrives inside the queue delay
         let main = event(
             Provider::Claude,
@@ -282,9 +296,9 @@ mod tests {
             gate.decide(&main, t + Duration::from_millis(60)),
             Verdict::Play
         );
-        gate.main_started(t + Duration::from_millis(60), SOUND);
+        gate.main_started(Provider::Claude, t + Duration::from_millis(60), SOUND);
         assert!(
-            !gate.subagent_still_wanted(t),
+            !gate.subagent_still_wanted(Provider::Claude, t),
             "the queued sub-agent sound must be dropped"
         );
     }
@@ -300,7 +314,7 @@ mod tests {
             ),
             Verdict::Play
         );
-        gate.main_started(t, SOUND);
+        gate.main_started(Provider::Codex, t, SOUND);
         assert_eq!(
             gate.decide(
                 &event(Provider::Codex, Category::MainComplete, Some("codex|b|1")),
@@ -308,6 +322,116 @@ mod tests {
             ),
             Verdict::Play
         );
+    }
+
+    fn sub(provider: Provider, id: &str) -> Classified {
+        event(
+            provider,
+            Category::SubagentComplete,
+            Some(&format!("{}|s||{id}", provider.key())),
+        )
+    }
+
+    fn main(provider: Provider, id: &str) -> Classified {
+        event(
+            provider,
+            Category::MainComplete,
+            Some(&format!("{}|s|{id}", provider.key())),
+        )
+    }
+
+    #[test]
+    fn claude_main_does_not_silence_codex_subagent() {
+        let mut gate = Gate::default();
+        let t = Instant::now();
+        assert_eq!(gate.decide(&main(Provider::Claude, "1"), t), Verdict::Play);
+        gate.main_started(Provider::Claude, t, SOUND);
+        assert_eq!(
+            gate.decide(&sub(Provider::Codex, "a"), t + Duration::from_millis(100)),
+            Verdict::Play
+        );
+        // but the same provider's own sub-agent is still suppressed
+        assert_eq!(
+            gate.decide(&sub(Provider::Claude, "a"), t + Duration::from_millis(100)),
+            Verdict::Skip("main_priority")
+        );
+    }
+
+    #[test]
+    fn codex_main_does_not_silence_claude_subagent() {
+        let mut gate = Gate::default();
+        let t = Instant::now();
+        gate.main_started(Provider::Codex, t, SOUND);
+        assert_eq!(gate.decide(&main(Provider::Codex, "1"), t), Verdict::Play);
+        assert_eq!(
+            gate.decide(&sub(Provider::Claude, "a"), t + Duration::from_millis(50)),
+            Verdict::Play
+        );
+    }
+
+    #[test]
+    fn parallel_subagents_merge_per_provider_only() {
+        let mut gate = Gate::default();
+        let t = Instant::now();
+        assert_eq!(gate.decide(&sub(Provider::Claude, "a"), t), Verdict::Play);
+        gate.subagent_started(Provider::Claude, t, SOUND);
+        // Codex sub-agents are not swallowed by Claude's sound...
+        let at = t + Duration::from_millis(40);
+        assert_eq!(gate.decide(&sub(Provider::Codex, "a"), at), Verdict::Play);
+        gate.subagent_started(Provider::Codex, at, SOUND);
+        // ...and each provider merges its own parallel sub-agents
+        for (i, id) in ["b", "c"].iter().enumerate() {
+            let at = t + Duration::from_millis(80 + 20 * i as u64);
+            assert_eq!(
+                gate.decide(&sub(Provider::Claude, id), at),
+                Verdict::Skip("merged")
+            );
+            assert_eq!(
+                gate.decide(&sub(Provider::Codex, id), at),
+                Verdict::Skip("merged")
+            );
+        }
+    }
+
+    #[test]
+    fn redelivered_event_is_still_a_duplicate_with_several_providers() {
+        let mut gate = Gate::default();
+        let t = Instant::now();
+        let claude = main(Provider::Claude, "1");
+        assert_eq!(gate.decide(&claude, t), Verdict::Play);
+        assert_eq!(gate.decide(&main(Provider::Codex, "1"), t), Verdict::Play);
+        assert_eq!(
+            gate.decide(&claude, t + Duration::from_millis(500)),
+            Verdict::Skip("duplicate")
+        );
+    }
+
+    #[test]
+    fn long_sound_of_one_provider_does_not_block_another() {
+        let mut gate = Gate::default();
+        let t = Instant::now();
+        let long = Duration::from_secs(25);
+        gate.main_started(Provider::Claude, t, long);
+        let later = t + Duration::from_secs(10);
+        assert_eq!(
+            gate.decide(&sub(Provider::Codex, "a"), later),
+            Verdict::Play
+        );
+        assert_eq!(
+            gate.decide(&sub(Provider::Claude, "a"), later),
+            Verdict::Skip("main_priority")
+        );
+    }
+
+    #[test]
+    fn queued_subagent_is_only_dropped_by_its_own_providers_main() {
+        let mut gate = Gate::default();
+        let t = Instant::now();
+        assert_eq!(gate.decide(&sub(Provider::Codex, "a"), t), Verdict::Play);
+        gate.main_started(Provider::Claude, t + Duration::from_millis(60), SOUND);
+        assert!(gate.subagent_still_wanted(Provider::Codex, t));
+        gate.main_started(Provider::Codex, t + Duration::from_millis(70), SOUND);
+        assert!(!gate.subagent_still_wanted(Provider::Codex, t));
     }
 
     #[test]

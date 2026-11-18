@@ -163,6 +163,8 @@ export const tr: Dictionary = {
   'error.E_BUSY': 'Başka bir entegrasyon işlemi sürüyor.',
   'error.E_POWERSHELL': 'PowerShell çalıştırılamadı: {detail}',
   'error.E_SCRIPT': 'Entegrasyon betiği başarısız oldu: {detail}',
+  'error.E_SUBAGENT_HOOKS': 'Alt ajan kancaları güncellenemedi. Hiçbir şey değiştirilmedi. {detail}',
+  'error.E_SUBAGENT_ROLLBACK': 'Alt ajan kancaları güncellenemedi ve şunlar için tam geri alınamadı: {detail}. Düzeltmek için Onar düğmesine basın.',
   'error.E_VERIFY': 'Değişiklik doğrulanamadı.',
   'error.E_INVALID_PROVIDER': 'Bilinmeyen sağlayıcı.',
   'error.E_INVALID_SOUND_KIND': 'Bilinmeyen ses türü.',

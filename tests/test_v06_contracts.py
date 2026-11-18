@@ -161,7 +161,7 @@ def test_scripts_never_evaluate_strings():
 
 def test_powershell_arguments_are_fixed_literals():
     rust = read('src-tauri/src/integrations.rs')
-    block = rust[rust.index('impl SubagentMode'):rust.index('/// Registers or removes the SubagentStop hook')]
+    block = rust[rust.index('impl SubagentMode'):rust.index('/// Raw copy of a provider')]
     assert 'vec!["-Subagent", "on"' in block and 'vec!["-Subagent", "off"' in block
     for user_data in ('format!', 'provider_str', 'path'):
         assert user_data not in block, user_data
@@ -199,3 +199,22 @@ def test_new_turkish_strings_are_really_translated():
     # placeholders survive translation
     for key in checked:
         assert sorted(re.findall(r'\{\w+\}', en[key])) == sorted(re.findall(r'\{\w+\}', tr[key])), key
+
+
+# ---- review fixes: provider-scoped gate, atomic hook sync ---------------------------------------
+def test_gate_priority_state_is_per_provider():
+    gate = read('src-tauri/src/gate.rs').split('#[cfg(test)]')[0]
+    assert 'lanes: HashMap<Provider, Lane>' in gate
+    for shared in ('    last_main:', '    main_until:', '    sub_until:'):
+        # the fields live only inside Lane, never directly on Gate
+        assert gate.split('pub struct Gate')[1].split('}')[0].count(shared) == 0, shared
+    lib = read('src-tauri/src/lib.rs')
+    for call in ('main_started(event.provider', 'subagent_started(event.provider', 'subagent_still_wanted(event.provider'):
+        assert call in lib, call
+
+
+def test_subagent_hook_sync_rolls_back_and_reports_truthfully():
+    rust = read('src-tauri/src/integrations.rs').split('#[cfg(test)]')[0]
+    assert 'fn sync_with' in rust and 'ops.restore(' in rust and 'E_SUBAGENT_ROLLBACK' in rust
+    lib = read('src-tauri/src/lib.rs')
+    assert 'E_HOOKS_INCONSISTENT' in lib, 'setting follows the real hooks when rollback failed'

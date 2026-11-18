@@ -508,9 +508,19 @@ async fn set_subagent_notifications(
     .await
     .map_err(|e| e.to_string())
     .and_then(|r| r);
-    if outcome.is_err() {
+    if let Err(error) = &outcome {
         let state = app.state::<AppState>();
-        let _ = update_settings(&state, |s| s.subagent_notifications = previous);
+        // Everything was put back: the setting returns to what it was. If undoing failed too, the hooks on disk
+        // are the truth, so the setting follows them (any handler still registered counts as on) and the UI
+        // shows the real state next to the error.
+        let wanted = if error.starts_with(integrations::E_HOOKS_INCONSISTENT) {
+            integrations::detect_all()
+                .map(|reports| reports.iter().any(|r| r.subagent == "ready"))
+                .unwrap_or(previous)
+        } else {
+            previous
+        };
+        let _ = update_settings(&state, |s| s.subagent_notifications = wanted);
     }
     outcome
 }
@@ -633,7 +643,7 @@ fn handle_event(app: &tauri::AppHandle, event: Classified) {
     match kind {
         SoundKind::Main => {
             if let Ok(mut gate) = state.gate.lock() {
-                gate.main_started(now, prepared.length);
+                gate.main_started(event.provider, now, prepared.length);
             }
             spawn_playback(prepared.wav);
             announce(app, &event);
@@ -645,9 +655,9 @@ fn handle_event(app: &tauri::AppHandle, event: Classified) {
                 thread::sleep(gate::SUBAGENT_DELAY);
                 let state = handle.state::<AppState>();
                 let wanted = state.gate.lock().is_ok_and(|mut gate| {
-                    let wanted = gate.subagent_still_wanted(now);
+                    let wanted = gate.subagent_still_wanted(event.provider, now);
                     if wanted {
-                        gate.subagent_started(Instant::now(), prepared.length);
+                        gate.subagent_started(event.provider, Instant::now(), prepared.length);
                     }
                     wanted
                 });

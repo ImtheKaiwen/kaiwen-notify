@@ -402,8 +402,11 @@ subagentBox.addEventListener('change', async () => {
     // Turning it on registers the sub-agent hook for connected providers; off removes only our handler.
     reports = await invoke<ProviderReport[]>('set_subagent_notifications', { enabled: wanted });
     notify(t(wanted ? 'toast.subagentsOn' : 'toast.subagentsOff'));
-  } catch (e) { fail(e); subagentBox.checked = !wanted; }
-  finally { subagentBox.disabled = false; await reload(); renderProviders(); }
+  } catch (e) {
+    fail(e);
+    // Show what is really installed now, including after a failed rollback.
+    try { reports = await invoke<ProviderReport[]>('get_integrations'); } catch { /* keep the last known report */ }
+  } finally { subagentBox.disabled = false; await reload(); renderProviders(); }
 });
 
 /* ---------- updates ---------- */

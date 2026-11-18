@@ -162,6 +162,8 @@ export const en = {
   'error.E_BUSY': 'Another integration operation is already running.',
   'error.E_POWERSHELL': 'PowerShell could not be started: {detail}',
   'error.E_SCRIPT': 'The integration script failed: {detail}',
+  'error.E_SUBAGENT_HOOKS': 'Sub-agent hooks could not be updated. Nothing was changed. {detail}',
+  'error.E_SUBAGENT_ROLLBACK': 'Sub-agent hooks could not be updated and could not be fully restored for: {detail}. Press Repair to fix them.',
   'error.E_VERIFY': 'The change could not be verified.',
   'error.E_INVALID_PROVIDER': 'Unknown provider.',
   'error.E_INVALID_SOUND_KIND': 'Unknown sound type.',

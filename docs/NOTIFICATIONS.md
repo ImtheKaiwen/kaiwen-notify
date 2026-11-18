@@ -37,6 +37,8 @@ hook exists and `ready` afterwards. "Verified" appears only after a real sub-age
 
 ## The SubagentStop hook is opt-in
 
+Toggling is all-or-nothing: if one provider's config cannot be updated, the providers already changed are restored byte for byte from a snapshot. If restoring fails too, the error names the affected providers (`E_SUBAGENT_ROLLBACK`), the setting follows the hooks actually on disk and Repair fixes it.
+
 Registering it costs a PowerShell process per finished sub-agent, so it is only added while the global
 **Sub-agent notifications** switch is on (default off). The switch adds/removes only our own handler (matched by the
 exact command) for providers that are already connected; third-party `SubagentStop` hooks are never touched.
@@ -53,7 +55,7 @@ Install/Repair keeps it when the switch is on, Uninstall always removes it. Code
 | Several sub-agents finish together | one sub-agent sound; the rest are merged while it plays |
 | Sub-agent finishes during or within 1.5 s after a main sound | not played (main has priority) |
 | Main completion arrives within 150 ms after a sub-agent | the queued sub-agent sound is dropped, only the main plays |
-| Different providers | independent |
+| Different providers | fully independent: priority, merging and long sounds are tracked per provider, so a Claude Code main sound never silences a Codex sub-agent (and vice versa) |
 
 Remembered identities are pruned after 60 s, so memory stays bounded.
 
