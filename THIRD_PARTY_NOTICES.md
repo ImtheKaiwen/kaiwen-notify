@@ -35,6 +35,6 @@ part of a release and are not uploaded anywhere.
 
 ## Software dependencies
 
-Audio decoding uses Symphonia (MPL-2.0; MP3, Ogg Vorbis and WAV only). Rust crates and npm packages keep their own licenses (mostly MIT/Apache-2.0); see `Cargo.lock` and
+Audio decoding uses Symphonia (MPL-2.0; MP3, Ogg Vorbis and WAV only), used unmodified from crates.io. Its source is available at https://github.com/pdeljanov/Symphonia and the MPL-2.0 text at https://www.mozilla.org/MPL/2.0/ ; MPL-2.0 covers only Symphonia's own files, not this application's code, which stays MIT. Rust crates and npm packages keep their own licenses (mostly MIT/Apache-2.0); see `Cargo.lock` and
 `package-lock.json`. Tauri is dual-licensed MIT/Apache-2.0. Microsoft Edge WebView2 is a Microsoft
 runtime installed separately under its own terms.

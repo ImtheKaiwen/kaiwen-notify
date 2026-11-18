@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased (proposed: 0.6.0)
+## 0.6.0
 
 ### Added
 - **Per-provider sounds**: Claude Code, Codex and Antigravity each have their own notification settings: enable switch, volume, task sound and sub-agent sound, with preview, change and reset-to-default. Custom sounds can be WAV, MP3 or Ogg Vorbis (up to 10 MB / 30 s) and are copied into the app's private data folder, so moving or deleting the original never breaks anything. A bundled softer sub-agent chime is the default for sub-agent sounds.
@@ -15,6 +15,17 @@
 - Audio: decode on demand (Symphonia, MP3/Ogg/WAV only) and play through WinMM from memory with volume applied; no resident audio thread or cached samples.
 - Existing users: the single shared sound becomes the task sound of every provider on first start; the old field stays in `settings.json` (downgrade safe).
 - Antigravity hook command, Claude Code and Codex `Stop` commands, and Codex's `notify` setting are unchanged.
+
+### Fixed
+- Duplicate and overlapping notifications: the same event delivered twice is one sound, parallel sub-agents of one provider are merged into one sound, and a provider's main completion takes priority over its own sub-agent sounds. Priority, merging and long sounds are tracked per provider, so one provider never silences another.
+- Turning sub-agent notifications on or off is all-or-nothing across providers: if one provider's config cannot be updated, the providers already changed are restored exactly (third-party hooks included); if the restore fails too, the error names the providers and the setting follows the hooks actually on disk.
+
+### Verification status and limitations
+- **Claude Code**: hooks, bridge, classification and playback are covered by automated tests and a real release-build end-to-end run with synthetic events. A real Claude Code sub-agent run through the installed hooks was **not verified**.
+- **Codex**: `SubagentStop` is implemented from the Codex hooks documentation and tested synthetically. It was **not verified with a real Codex sub-agent run**; Codex asks you to trust the new hook first. Codex's `notify` setting is never touched.
+- **Antigravity**: main-task sound only. It documents no sub-agent finished event, so the sub-agent row is disabled with an explanation. Desktop hook command unchanged from 0.5.1; IDE and CLI real tasks are **not verified**.
+- **Performance** (single run, same laptop, vs 0.5.1): tray-only about +1.6 MB, window open about +1 MB, about 20 ms CPU per played sound, executable +1.5 MB, idle CPU still 0, no WebView2 in tray-only mode. Details in `docs/PERFORMANCE.md`.
+- New dependency Symphonia (MPL-2.0, MP3/Ogg Vorbis/WAV decoding only) is listed in `THIRD_PARTY_NOTICES.md`.
 
 ## 0.5.1
 

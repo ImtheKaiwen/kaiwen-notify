@@ -3,7 +3,7 @@
 These numbers describe one build on one computer. They are observations, not guarantees. Other machines, Windows
 builds, WebView2 versions and drivers will differ.
 
-## Per-provider sounds and sub-agent events: old vs new (unreleased branch)
+## Per-provider sounds and sub-agent events: old vs new (v0.6.0)
 
 Single run on the machine below, 18 Nov 2026, Windows 11 build 26200, WebView2 157, release builds, measured with
 `Get-Process` (working set, cumulative CPU time) and `Get-CimInstance` for WebView2 child processes. Script:
