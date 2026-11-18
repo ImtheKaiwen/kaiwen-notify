@@ -85,7 +85,7 @@ Short version (details, method and caveats in [docs/PERFORMANCE.md](docs/PERFORM
 | First window (splash) after launch | about 0.5 to 0.7 s; the main window follows after the ~2.4 s splash |
 | Idle CPU | 0 to 0.06 s over 30 s windows |
 
-The per-provider sounds change (unreleased) was measured separately against v0.5.1 on the same laptop: about +1.6 MB tray-only and about +1 MB with the window open, about 20 ms of CPU per played sound, +2.6 MB peak while a short chime plays, executable +1.5 MB (audio decoders), idle CPU still 0, still no WebView2 process in tray-only mode. Single run; table and caveats in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#per-provider-sounds-and-sub-agent-events-old-vs-new-unreleased-branch).
+The per-provider sounds change (v0.6.0) was measured separately against v0.5.1 on the same laptop: about +1.6 MB tray-only and about +1 MB with the window open, about 20 ms of CPU per played sound, +2.6 MB peak while a short chime plays, executable +1.5 MB (audio decoders), idle CPU still 0, still no WebView2 process in tray-only mode. Single run; table and caveats in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#per-provider-sounds-and-sub-agent-events-old-vs-new-v060).
 
 These are measurements from one laptop (Windows 11 build 26200, Core i5-12450H, 16 GB), taken with `Get-Process` on an installed release build, not guarantees. The window-open number includes Microsoft's WebView2 processes, which are shared-runtime processes that Windows reports as separate working sets.
 
