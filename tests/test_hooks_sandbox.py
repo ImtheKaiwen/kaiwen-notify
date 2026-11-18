@@ -127,6 +127,11 @@ def anti_cmd(home, local):
     return cfg['kaiwen-notify']['Stop'][0]['command']
 
 
+def msgs(datagrams):
+    """Decoded JSON datagrams the bridge sent."""
+    return [json.loads(d.decode('utf8')) for d in datagrams]
+
+
 def invoke_bridge(source, payload, port_holder):
     """Runs the bridge with a stdin payload; returns (UDP datagrams received, stdout).
     Uses a free private port (KAIWEN_NOTIFY_PORT) so it works beside a running Kaiwen Notify."""
@@ -171,7 +176,8 @@ def test_antigravity_stop_payloads(extra, expect_event):
     got, result = invoke_bridge('antigravity', json.dumps({**STOP_BASE, **extra}), None)
     assert result.returncode == 0
     assert json.loads(result.stdout.strip()) == {'decision': 'stop'}, 'must never block the agent'
-    assert (got == [b'{"source":"antigravity","kind":"completed"}']) == expect_event, got
+    sent = msgs(got)
+    assert (len(sent) == 1 and sent[0]['kind'] == 'completed') == expect_event, got
 
 
 def test_antigravity_garbage_or_empty_stdin_still_returns_valid_json():
@@ -220,7 +226,9 @@ def test_antigravity_product_detected_from_transcript_path(folder, product):
                'transcriptPath': f'C:/Users/Someone Else/.gemini/{folder}/brain/abc/.system_generated/logs/transcript.jsonl'}
     got, result = invoke_bridge('antigravity', json.dumps(payload), None)
     assert json.loads(result.stdout.strip()) == {'decision': 'stop'}
-    assert got == [('{"source":"antigravity","kind":"completed","product":"%s"}' % product).encode()], got
+    sent = msgs(got)
+    assert len(sent) == 1 and sent[0]['source'] == 'antigravity' and sent[0]['kind'] == 'completed' and sent[0]['product'] == product, got
+    assert sent[0]['session'] == STOP_BASE['conversationId'] and sent[0]['turn'] == '1'
     assert b'Someone' not in b''.join(got), 'no paths or user names leave the hook'
 
 
@@ -228,7 +236,8 @@ def test_antigravity_not_idle_reports_a_silent_seen_event():
     payload = {**STOP_BASE, 'terminationReason': 'model_stop', 'fullyIdle': False,
                'transcriptPath': 'C:/Users/x/.gemini/antigravity/brain/a/.system_generated/logs/transcript.jsonl'}
     got, result = invoke_bridge('antigravity', json.dumps(payload), None)
-    assert got == [b'{"source":"antigravity","kind":"seen","note":"not_idle","product":"app"}'], got
+    sent = msgs(got)
+    assert len(sent) == 1 and (sent[0]['kind'], sent[0]['note'], sent[0]['product']) == ('seen', 'not_idle', 'app'), got
     assert json.loads(result.stdout.strip()) == {'decision': 'stop'}
 
 
@@ -395,7 +404,7 @@ def test_stored_command_runs_from_spaced_unicode_profile_under_every_launcher(pr
         assert json.loads(result.stdout.strip()) == {'decision': 'stop'}, (name, result.stdout)
         assert result.stderr.strip() == '', (name, result.stderr)
     log = (local / 'KaiwenNotify' / 'diag.log').read_text('utf8')
-    assert log.count('antigravity payload product=app fullyIdle=True reason=NO_TOOL_CALL') == 3, log
+    assert log.count('antigravity payload hook= product=app fullyIdle=True reason=NO_TOOL_CALL') == 3, log
 
 
 def test_bad_or_missing_script_never_breaks_the_agent(profile):
@@ -428,11 +437,11 @@ def test_diag_log_is_bounded_and_opt_in(profile):
 # ---- bridge behaviour for every provider and unusual Antigravity payloads -------------------------
 def test_claude_and_codex_events_still_flow():
     got, result = invoke_bridge('claude', json.dumps({'stop_hook_active': False}), None)
-    assert got == [b'{"source":"claude","kind":"completed"}'] and result.stdout.strip() == ''
+    assert msgs(got) == [{'source': 'claude', 'kind': 'completed'}] and result.stdout.strip() == ''
     got, result = invoke_bridge('claude', json.dumps({'stop_hook_active': True}), None)
     assert got == [], 'Claude loop guard: stop_hook_active must stay silent'
     got, result = invoke_bridge('codex', json.dumps({'turn_id': 'x'}), None)
-    assert got == [b'{"source":"codex","kind":"completed"}'] and result.stdout.strip() == '{}'
+    assert msgs(got) == [{'source': 'codex', 'kind': 'completed', 'turn': 'x'}] and result.stdout.strip() == '{}'
 
 
 @pytest.mark.parametrize('payload,expected', [
@@ -448,5 +457,140 @@ def test_claude_and_codex_events_still_flow():
 ])
 def test_antigravity_unusual_payloads(payload, expected):
     got, result = invoke_bridge('antigravity', json.dumps(payload), None)
-    assert len(got) == 1 and b'"kind":"' + expected + b'"' in got[0], got
+    assert len(got) == 1 and msgs(got)[0]['kind'] == expected.decode(), got
     assert json.loads(result.stdout.strip()) == {'decision': 'stop'}
+
+
+# ---- v0.6: SubagentStop hooks (Claude Code, Codex) and sub-agent event metadata -------------------------
+SUB_PAYLOAD = {'hook_event_name': 'SubagentStop', 'session_id': 'sess-1', 'agent_id': 'agent-7',
+               'agent_type': 'Explore', 'agent_transcript_path': 'C:/secret/place/agent-7.jsonl',
+               'last_assistant_message': 'TOP SECRET PROMPT TEXT', 'stop_hook_active': False}
+
+
+def hook_cmd(home, local, source):
+    script = str(local / 'KaiwenNotify' / 'hooks' / 'send-event.ps1')
+    return PS_PREFIX + f'-File "{script}" -Source {source}'
+
+
+def sub_commands(home, relpath, event='SubagentStop'):
+    cfg = load(home, *relpath)
+    return [h['command'] for g in cfg.get('hooks', {}).get(event, []) for h in g.get('hooks', [])]
+
+
+def test_bridge_claude_stop_vs_subagentstop_metadata():
+    got, _ = invoke_bridge('claude', json.dumps({'hook_event_name': 'Stop', 'session_id': 's', 'prompt_id': 'p1'}), None)
+    assert msgs(got) == [{'source': 'claude', 'kind': 'completed', 'hook': 'Stop', 'session': 's', 'turn': 'p1'}]
+    got, _ = invoke_bridge('claude', json.dumps(SUB_PAYLOAD), None)
+    assert msgs(got) == [{'source': 'claude', 'kind': 'completed', 'hook': 'SubagentStop', 'session': 'sess-1',
+                          'agent': 'agent-7', 'agent_type': 'Explore'}]
+
+
+def test_bridge_never_forwards_prompts_paths_or_replies():
+    got, _ = invoke_bridge('claude', json.dumps({**SUB_PAYLOAD, 'cwd': 'C:/Users/Someone Else/proj',
+                                                  'transcript_path': 'C:/Users/Someone Else/t.jsonl'}), None)
+    raw = b''.join(got)
+    for secret in (b'SECRET', b'Someone', b'agent-7.jsonl', b'transcript', b'secret/place'):
+        assert secret not in raw, secret
+    assert len(raw) < 400
+
+
+def test_bridge_sanitizes_and_caps_ids():
+    payload = {'hook_event_name': 'SubagentStop', 'session_id': 'x' * 500, 'agent_id': 'a\x01b\nc',
+               'agent_type': '  Plan  '}
+    got, _ = invoke_bridge('claude', json.dumps(payload), None)
+    sent = msgs(got)[0]
+    assert len(sent['session']) == 100 and sent['agent'] == 'abc' and sent['agent_type'] == 'Plan'
+
+
+def test_bridge_codex_subagentstop_and_stdout():
+    payload = {'hook_event_name': 'SubagentStop', 'session_id': 'c1', 'turn_id': 't9', 'agent_id': 'w1',
+               'agent_type': 'worker'}
+    got, result = invoke_bridge('codex', json.dumps(payload), None)
+    assert msgs(got) == [{'source': 'codex', 'kind': 'completed', 'hook': 'SubagentStop', 'session': 'c1',
+                          'turn': 't9', 'agent': 'w1', 'agent_type': 'worker'}]
+    assert result.stdout.strip() == '{}'
+
+
+def test_bridge_parallel_subagents_send_distinct_identities():
+    ids = set()
+    for agent in ('a', 'b', 'c'):
+        got, _ = invoke_bridge('claude', json.dumps({**SUB_PAYLOAD, 'agent_id': agent}), None)
+        ids.add(msgs(got)[0]['agent'])
+    assert ids == {'a', 'b', 'c'}
+
+
+def test_bridge_antigravity_carries_no_agent_fields():
+    payload = {'terminationReason': 'NO_TOOL_CALL', 'fullyIdle': True, 'executionNum': 2, 'conversationId': 'c-1',
+               'agent_id': 'should-not-matter', 'lastUserInput': 'PRIVATE PROMPT',
+               'transcriptPath': 'C:/Users/x/.gemini/antigravity/brain/a/.system_generated/logs/transcript.jsonl'}
+    got, _ = invoke_bridge('antigravity', json.dumps(payload), None)
+    sent = msgs(got)[0]
+    assert 'agent' not in sent and 'agent_type' not in sent and 'PRIVATE' not in json.dumps(sent)
+    assert sent['product'] == 'app' and sent['session'] == 'c-1' and sent['turn'] == '2'
+
+
+def test_default_install_does_not_register_subagent_hooks(profile):
+    home, local = profile
+    run('install-hooks.ps1', home, local)
+    assert sub_commands(home, ('.claude', 'settings.json')) == []
+    assert sub_commands(home, ('.codex', 'hooks.json')) == []
+
+
+def test_subagent_hooks_on_off_idempotent_and_scoped(profile):
+    home, local = profile
+    run('install-hooks.ps1', home, local)
+    stop_claude = load(home, '.claude', 'settings.json')['hooks']['Stop']
+    for _ in range(2):  # idempotent
+        run('install-hooks.ps1', home, local, '-Provider', 'all', '-Subagent', 'on', '-SubagentOnly')
+        assert sub_commands(home, ('.claude', 'settings.json')) == [hook_cmd(home, local, 'claude')]
+        assert sub_commands(home, ('.codex', 'hooks.json')) == [hook_cmd(home, local, 'codex')]
+    assert load(home, '.claude', 'settings.json')['hooks']['Stop'] == stop_claude, 'Stop hooks untouched'
+    assert 'SubagentStop' not in json.dumps(load(home, *CFG)), 'Antigravity has no sub-agent hook'
+    assert (home / '.codex' / 'config.toml').read_bytes() == TOML.encode('utf8')
+    run('install-hooks.ps1', home, local, '-Provider', 'all', '-Subagent', 'off', '-SubagentOnly')
+    assert sub_commands(home, ('.claude', 'settings.json')) == [] and sub_commands(home, ('.codex', 'hooks.json')) == []
+    assert load(home, '.claude', 'settings.json')['hooks']['Stop'] == stop_claude
+    assert count_ours((home / '.claude' / 'settings.json').read_text('utf8')) == 1, 'the Stop hook is still installed'
+
+
+def test_third_party_subagent_hooks_survive_everything(profile):
+    home, local = profile
+    theirs = {'hooks': [{'type': 'command', 'command': 'echo theirs'}]}
+    for rel in (('.claude', 'settings.json'), ('.codex', 'hooks.json')):
+        path = home.joinpath(*rel)
+        cfg = json.loads(path.read_text('utf8'))
+        cfg.setdefault('hooks', {})['SubagentStop'] = [theirs]
+        path.write_text(json.dumps(cfg), 'utf8')
+    run('install-hooks.ps1', home, local)
+    run('install-hooks.ps1', home, local, '-Subagent', 'on', '-SubagentOnly')
+    for rel, src in ((('.claude', 'settings.json'), 'claude'), (('.codex', 'hooks.json'), 'codex')):
+        assert sub_commands(home, rel) == ['echo theirs', hook_cmd(home, local, src)]
+    run('install-hooks.ps1', home, local, '-Subagent', 'off', '-SubagentOnly')
+    for rel in (('.claude', 'settings.json'), ('.codex', 'hooks.json')):
+        assert sub_commands(home, rel) == ['echo theirs']
+    run('install-hooks.ps1', home, local, '-Subagent', 'on', '-SubagentOnly')
+    run('uninstall-hooks.ps1', home, local)
+    for rel in (('.claude', 'settings.json'), ('.codex', 'hooks.json')):
+        assert sub_commands(home, rel) == ['echo theirs'], 'uninstall removes only our SubagentStop handler'
+    assert load(home, '.claude', 'settings.json')['hooks']['Stop'] == FOREIGN_CLAUDE['hooks']['Stop']
+    assert load(home, *CFG) == {**FOREIGN_ANTI}
+    assert (home / '.codex' / 'config.toml').read_bytes() == TOML.encode('utf8')
+    run('uninstall-hooks.ps1', home, local)  # idempotent
+
+
+def test_subagent_only_never_installs_a_stop_hook(profile):
+    home, local = profile
+    run('install-hooks.ps1', home, local, '-Provider', 'claude', '-Subagent', 'on', '-SubagentOnly')
+    cfg = load(home, '.claude', 'settings.json')
+    assert count_ours(json.dumps(cfg['hooks']['Stop'])) == 0, 'no Stop hook appears as a side effect'
+    assert sub_commands(home, ('.claude', 'settings.json')) == [hook_cmd(home, local, 'claude')]
+
+
+def test_antigravity_hook_is_unchanged_by_subagent_work(profile):
+    home, local = profile
+    run('install-hooks.ps1', home, local)
+    before = load(home, *CFG)
+    run('install-hooks.ps1', home, local, '-Subagent', 'on')
+    run('install-hooks.ps1', home, local, '-Subagent', 'off', '-SubagentOnly')
+    assert load(home, *CFG) == before
+    assert before['kaiwen-notify']['Stop'] == [{'type': 'command', 'command': ANTI_COMMAND, 'timeout': 10}]

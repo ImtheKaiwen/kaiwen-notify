@@ -75,3 +75,27 @@ dialog::backdrop{background:rgba(0,0,0,.4)}dialog h2{font-size:15px}dialog p{mar
 .toast.visible{opacity:1;transform:translate(-50%,0)}.toast.error{background:var(--danger);color:#fff}
 @media(max-width:520px){main{padding:0 var(--s4) var(--s4)}h1{font-size:22px}.pstate{min-width:0}}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+
+/* ---- per-provider sound cards ---- */
+.section-title{font-size:13px;margin:var(--s2) 0 0;font-weight:600}
+.pstack{display:flex;flex-direction:column;gap:var(--s3);margin-top:var(--s3)}
+.pcard-head{display:flex;align-items:center;gap:var(--s3);margin-bottom:var(--s3)}
+.pcard-head .grow{font-weight:600}
+.vol{display:flex;align-items:center;gap:var(--s3);padding:var(--s2) 0 var(--s3)}
+.vol .label{width:96px;flex-shrink:0;font-size:12px;color:var(--muted)}
+.vol .value{width:40px;text-align:right;font-size:12px;font-variant-numeric:tabular-nums;color:var(--muted)}
+input[type=range]{-webkit-appearance:none;appearance:none;flex:1;min-width:0;height:4px;border-radius:4px;outline:none;margin:0;cursor:pointer;background:linear-gradient(to right,var(--accent) var(--pct,100%),var(--line) var(--pct,100%))}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);border:2px solid var(--bg);box-shadow:0 0 0 1px var(--line)}
+input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:6px}
+input[type=range]:disabled{opacity:.45;cursor:not-allowed}
+.srow{display:flex;align-items:center;gap:var(--s3);padding:var(--s3) 0;border-top:1px solid var(--line)}
+.srow .kind{width:96px;flex-shrink:0;font-size:12px;font-weight:600}
+.srow .file{flex:1;min-width:0}
+.srow .file .name{font-size:13px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.srow .file .sub{font-size:11px;color:var(--muted)}
+.srow .file .sub.warn{color:var(--danger)}
+.srow .tools{display:flex;gap:var(--s2);flex-shrink:0}
+.srow.off .file .name{color:var(--muted)}
+.btn-sm{min-height:28px;padding:0 var(--s3);font-size:12px}
+.pcard.disabled .vol,.pcard.disabled .srow{opacity:.55}
+@media(max-width:520px){.srow{flex-wrap:wrap}.srow .kind{width:100%}.vol .label{width:72px}}

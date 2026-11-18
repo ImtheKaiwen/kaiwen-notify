@@ -59,6 +59,47 @@ function Get-AntigravityHandlerKind($Handler) {
     return 'legacy'
 }
 
+function Set-Property($Object, [string]$Name, $Value) {
+    if (Has-Property $Object $Name) { $Object.$Name = $Value }
+    else { $Object | Add-Member -MemberType NoteProperty -Name $Name -Value $Value }
+}
+# SubagentStop (Claude Code and Codex): added only on request (-Subagent on) and removed with -Subagent off or on
+# uninstall. Handlers are matched by the exact command string, so other people's SubagentStop hooks are never touched.
+function Set-SubagentHook($Object, [string]$Command, [bool]$Want) {
+    if (-not (Has-Property $Object 'hooks') -or $null -eq $Object.hooks) {
+        if (-not $Want) { return $false }
+        Set-Property $Object 'hooks' ([pscustomobject]@{})
+    }
+    $groups = @()
+    if (Has-Property $Object.hooks 'SubagentStop') { $groups = @($Object.hooks.SubagentStop | Where-Object { $null -ne $_ }) }
+    $has = $false
+    foreach ($g in $groups) {
+        foreach ($h in @($g.hooks)) {
+            if ($null -ne $h -and (Has-Property $h 'command') -and $h.command -ceq $Command -and $h.type -eq 'command') { $has = $true }
+        }
+    }
+    if ($Want) {
+        if ($has) { return $false }
+        $new = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $Command; timeout = 10 }) }
+        Set-Property $Object.hooks 'SubagentStop' (@($groups) + @($new))
+        return $true
+    }
+    if (-not $has) { return $false }
+    $kept = @()
+    foreach ($g in $groups) {
+        $remaining = @(@($g.hooks) | Where-Object { -not ($null -ne $_ -and (Has-Property $_ 'command') -and $_.command -ceq $Command -and $_.type -eq 'command') })
+        if ($remaining.Count -gt 0) { $g.hooks = @($remaining); $kept += $g }
+        elseif (@($g.hooks).Count -eq 0) { $kept += $g }
+        else {
+            $extra = @($g.PSObject.Properties.Name | Where-Object { $_ -ne 'hooks' })
+            if ($extra.Count -gt 0) { $g.hooks = @(); $kept += $g }
+        }
+    }
+    if ($kept.Count -gt 0) { $Object.hooks.SubagentStop = @($kept) }
+    else { [void]$Object.hooks.PSObject.Properties.Remove('SubagentStop') }
+    return $true
+}
+
 $hookScript = Join-Path $env:LOCALAPPDATA 'KaiwenNotify\hooks\send-event.ps1'
 $claudeExpected = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript + '" -Source claude'
 
@@ -106,6 +147,11 @@ if (Test-Path -LiteralPath $claudePath) {
             Commit-Json $claudePath $claude "Claude Code: $removed Kaiwen Notify hook kaldirildi."
         } else { Write-Host 'Claude Code: kaldirilacak Kaiwen Notify hook bulunamadi.' }
     }
+}
+# SubagentStop: remove only our own handler.
+if (Test-Path -LiteralPath $claudePath) {
+    $claudeSub = Read-JsonObject $claudePath
+    if (Set-SubagentHook $claudeSub $claudeExpected $false) { Commit-Json $claudePath $claudeSub 'Claude Code: SubagentStop hook kaldirildi.' }
 }
 }
 
@@ -177,6 +223,11 @@ if (Test-Path -LiteralPath $codexHooksPath) {
             Commit-Json $codexHooksPath $codexHooks "Codex: $removed Kaiwen Notify Stop hook kaldirildi. Native notify korunuyor."
         } else { Write-Host 'Codex: kaldirilacak Kaiwen Notify Stop hook bulunamadi.' }
     }
+}
+# SubagentStop: remove only our own handler.
+if (Test-Path -LiteralPath $codexHooksPath) {
+    $codexSub = Read-JsonObject $codexHooksPath
+    if (Set-SubagentHook $codexSub $codexExpected $false) { Commit-Json $codexHooksPath $codexSub 'Codex: SubagentStop hook kaldirildi.' }
 }
 
 # Backward compatibility: remove only the exact legacy v0.2 notify field if

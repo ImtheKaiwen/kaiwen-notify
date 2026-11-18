@@ -74,7 +74,7 @@ def test_onboarding_contract():
         assert f'include_str!("../../scripts/{filename}")' in integ
     # The Codex Desktop computer-use `notify` setting must never be read or written by the app.
     assert r"'.codex\hooks.json'" in (ROOT / 'scripts/install-hooks.ps1').read_text()
-    assert 'config.toml' not in rust and 'config.toml' not in integ
+    assert 'config.toml' not in rust and 'config.toml' not in integ.split('#[cfg(test)]')[0]  # test fixtures may create one
     assert 'native notify korunuyor' in (ROOT / 'scripts/install-hooks.ps1').read_text()
 
 

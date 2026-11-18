@@ -1,6 +1,12 @@
 # Installs user-level hooks without deleting existing hooks or overwriting Codex notify.
 # Run from PowerShell: powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\install-hooks.ps1
-param([ValidateSet('all','claude','codex','antigravity')][string]$Provider = 'all')
+param(
+    [ValidateSet('all','claude','codex','antigravity')][string]$Provider = 'all',
+    # on: add the SubagentStop hook (Claude Code, Codex); off: remove it; keep: leave it as it is.
+    [ValidateSet('keep','on','off')][string]$Subagent = 'keep',
+    # Only manage the SubagentStop hook; do not touch the Stop hooks.
+    [switch]$SubagentOnly
+)
 $ErrorActionPreference = 'Stop'
 
 function Write-Utf8([string]$Path, [string]$Text) {
@@ -57,6 +63,43 @@ function Get-AntigravityHandlerKind($Handler) {
     return 'legacy'
 }
 
+# SubagentStop (Claude Code and Codex): added only on request (-Subagent on) and removed with -Subagent off or on
+# uninstall. Handlers are matched by the exact command string, so other people's SubagentStop hooks are never touched.
+function Set-SubagentHook($Object, [string]$Command, [bool]$Want) {
+    if (-not (Has-Property $Object 'hooks') -or $null -eq $Object.hooks) {
+        if (-not $Want) { return $false }
+        Set-Property $Object 'hooks' ([pscustomobject]@{})
+    }
+    $groups = @()
+    if (Has-Property $Object.hooks 'SubagentStop') { $groups = @($Object.hooks.SubagentStop | Where-Object { $null -ne $_ }) }
+    $has = $false
+    foreach ($g in $groups) {
+        foreach ($h in @($g.hooks)) {
+            if ($null -ne $h -and (Has-Property $h 'command') -and $h.command -ceq $Command -and $h.type -eq 'command') { $has = $true }
+        }
+    }
+    if ($Want) {
+        if ($has) { return $false }
+        $new = [pscustomobject]@{ hooks = @([pscustomobject]@{ type = 'command'; command = $Command; timeout = 10 }) }
+        Set-Property $Object.hooks 'SubagentStop' (@($groups) + @($new))
+        return $true
+    }
+    if (-not $has) { return $false }
+    $kept = @()
+    foreach ($g in $groups) {
+        $remaining = @(@($g.hooks) | Where-Object { -not ($null -ne $_ -and (Has-Property $_ 'command') -and $_.command -ceq $Command -and $_.type -eq 'command') })
+        if ($remaining.Count -gt 0) { $g.hooks = @($remaining); $kept += $g }
+        elseif (@($g.hooks).Count -eq 0) { $kept += $g }
+        else {
+            $extra = @($g.PSObject.Properties.Name | Where-Object { $_ -ne 'hooks' })
+            if ($extra.Count -gt 0) { $g.hooks = @(); $kept += $g }
+        }
+    }
+    if ($kept.Count -gt 0) { $Object.hooks.SubagentStop = @($kept) }
+    else { [void]$Object.hooks.PSObject.Properties.Remove('SubagentStop') }
+    return $true
+}
+
 $target = Join-Path $env:LOCALAPPDATA 'KaiwenNotify\hooks'
 $hookScript = Join-Path $target 'send-event.ps1'
 [void](New-Item -ItemType Directory -Force -Path $target)
@@ -64,6 +107,7 @@ Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'send-event.ps1') -Destination $
 Write-Host "Hook kurulumu: $hookScript"
 
 if ($Provider -in 'all','claude') {
+if (-not $SubagentOnly) {
 # 1. Claude Code: user-level Stop hook. All existing hooks remain in place.
 $claudePath = Join-Path $env:USERPROFILE '.claude\settings.json'
 $claude = Read-JsonObject $claudePath
@@ -81,7 +125,19 @@ if (-not $already) {
 } else { Write-Host 'Claude Code: zaten kurulu.' }
 }
 
-if ($Provider -in 'all','antigravity') {
+$claudePath = Join-Path $env:USERPROFILE '.claude\settings.json'
+$claudeSubCmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript + '" -Source claude'
+if ($Subagent -ne 'keep' -and (Test-Path -LiteralPath $claudePath)) {
+    $claudeNow = Read-JsonObject $claudePath
+    if (Set-SubagentHook $claudeNow $claudeSubCmd ($Subagent -eq 'on')) {
+        Backup-Existing $claudePath
+        Write-Utf8 $claudePath ($claudeNow | ConvertTo-Json -Depth 40)
+        Write-Host "Claude Code: SubagentStop hook $Subagent."
+    }
+}
+}
+
+if ($Provider -in 'all','antigravity' -and -not $SubagentOnly) {
 # 2. Google Antigravity (Desktop App, IDE and CLI read the same global file): named Stop hook group.
 $antiPath = Join-Path $env:USERPROFILE '.gemini\config\hooks.json'
 $anti = Read-JsonObject $antiPath
@@ -123,6 +179,7 @@ if ($changed) {
 }
 
 if ($Provider -in 'all','codex') {
+if (-not $SubagentOnly) {
 # 3. Codex CLI / Desktop: install independent Stop hook in hooks.json.
 # IMPORTANT: never change Codex Desktop's top-level notify; it may be the
 # codex-computer-use.exe turn-ended safety/lifecycle callback.
@@ -149,6 +206,18 @@ if (-not $already) {
     Write-Host 'Codex: Stop hook eklendi. Mevcut config.toml ve notify korunuyor.'
     Write-Host 'Codex ilk kullanimda hook guven onayi isteyebilir (CLI: /hooks; Desktop: Settings > Hooks).'
 } else { Write-Host 'Codex: Stop hook zaten kurulu; native notify korunuyor.' }
+}
+
+$codexSubPath = Join-Path $env:USERPROFILE '.codex\hooks.json'
+$codexSubCmd = 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $hookScript + '" -Source codex'
+if ($Subagent -ne 'keep' -and (Test-Path -LiteralPath $codexSubPath)) {
+    $codexNow = Read-JsonObject $codexSubPath
+    if (Set-SubagentHook $codexNow $codexSubCmd ($Subagent -eq 'on')) {
+        Backup-Existing $codexSubPath
+        Write-Utf8 $codexSubPath ($codexNow | ConvertTo-Json -Depth 40)
+        Write-Host "Codex: SubagentStop hook $Subagent. Codex hook guven onayi isteyebilir."
+    }
+}
 }
 
 Write-Host ''

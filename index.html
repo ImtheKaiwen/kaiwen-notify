@@ -36,21 +36,15 @@
         <div id="antigravity-diag" class="diag" hidden></div>
       </section>
 
-      <section class="card">
-        <h2 data-i18n="sound.title"></h2>
-        <div class="row">
-          <div class="grow"><div id="sound-name" class="strong ellipsis"></div><div id="sound-info" class="muted small"></div></div>
-          <button id="pick-sound" class="btn" type="button" data-i18n="sound.change"></button>
-        </div>
-        <div class="actions">
-          <button id="test-sound" class="btn btn-primary" type="button"><span class="btn-label" data-i18n="sound.test"></span></button>
-          <button id="reset-sound" class="btn btn-quiet" type="button" data-i18n="sound.reset"></button>
-        </div>
+      <section id="sounds-section" aria-labelledby="sounds-title">
+        <h2 class="section-title" id="sounds-title" data-i18n="sound.title"></h2>
+        <div id="provider-sounds" class="pstack"></div>
       </section>
 
       <section class="card">
         <h2 data-i18n="settings.title"></h2>
         <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.enable"></span><span class="muted small block" data-i18n="settings.enableDesc"></span></span><span class="switch"><input id="enabled" type="checkbox" checked /><span class="track"></span></span></label>
+        <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.subagents"></span><span class="muted small block" data-i18n="settings.subagentsDesc"></span></span><span class="switch"><input id="subagent-notifications" type="checkbox" /><span class="track"></span></span></label>
         <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.autoUpdate"></span><span class="muted small block" id="auto-update-desc"></span></span><span class="switch"><input id="auto-update" type="checkbox" checked /><span class="track"></span></span></label>
         <label class="row setting"><span class="grow"><span class="strong" data-i18n="settings.autostart"></span><span class="muted small block" data-i18n="settings.autostartDesc"></span></span><span class="switch"><input id="autostart" type="checkbox" /><span class="track"></span></span></label>
         <div class="row setting"><span class="grow strong" data-i18n="settings.theme"></span>

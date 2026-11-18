@@ -80,6 +80,9 @@ pub struct ProviderReport {
     pub id: &'static str,
     pub state: ProviderState,
     pub detail: Option<String>,
+    /// Sub-agent notification capability: `unsupported` (no documented sub-agent event), `hook_missing`
+    /// (supported, SubagentStop hook not registered) or `ready` (hook registered).
+    pub subagent: &'static str,
 }
 
 #[derive(Clone, Serialize)]
@@ -266,11 +269,34 @@ fn needs_migration(provider: Provider) -> bool {
             .any(|k| matches!(k, HandlerKind::Current | HandlerKind::Compatible))
 }
 
+/// Whether sub-agent notifications can work for this provider right now. Based on what is really registered in
+/// the provider's config, never on a hard-coded assumption. Antigravity documents no sub-agent finished event.
+fn subagent_state(provider: Provider) -> &'static str {
+    if provider == Provider::Antigravity {
+        return "unsupported";
+    }
+    let (Ok(home), Ok(script)) = (home_dir(), expected_hook_path()) else {
+        return "hook_missing";
+    };
+    let json = read_json_optional(&provider.config_file(&home));
+    if has_own_hook(
+        &json,
+        &["hooks", "SubagentStop"],
+        &hook_command(&script, provider.id()),
+    ) {
+        "ready"
+    } else {
+        "hook_missing"
+    }
+}
+
 pub fn detect_one(provider: Provider) -> Result<ProviderReport, String> {
+    let subagent = subagent_state(provider);
     let report = |state, detail: Option<&str>| ProviderReport {
         id: provider.id(),
         state,
         detail: detail.map(str::to_owned),
+        subagent,
     };
     if !cfg!(windows) {
         return Ok(report(ProviderState::Unsupported, Some("unsupported_os")));
@@ -305,7 +331,12 @@ pub fn detect_all() -> Result<Vec<ProviderReport>, String> {
 
 /// Runs the bundled PowerShell script for one provider. Returns a short error on failure.
 #[cfg(windows)]
-fn run_script(scripts_dir: &Path, install: bool, provider: Provider) -> Result<(), String> {
+fn run_script(
+    scripts_dir: &Path,
+    install: bool,
+    provider: Provider,
+    subagent: SubagentMode,
+) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let path = scripts_dir.join(if install {
@@ -323,6 +354,7 @@ fn run_script(scripts_dir: &Path, install: bool, provider: Provider) -> Result<(
         ])
         .arg(&path)
         .args(["-Provider", provider.id()])
+        .args(subagent.args(install))
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("E_POWERSHELL:{e}"))?;
@@ -330,17 +362,20 @@ fn run_script(scripts_dir: &Path, install: bool, provider: Provider) -> Result<(
         return Ok(());
     }
     let details = String::from_utf8_lossy(&output.stderr);
-    Err(details
-        .lines()
-        .next()
-        .unwrap_or("bilinmeyen hata")
-        .chars()
-        .take(200)
-        .collect())
+    Err(format!(
+        "E_SCRIPT:{}",
+        details
+            .lines()
+            .next()
+            .unwrap_or("unknown")
+            .chars()
+            .take(200)
+            .collect::<String>()
+    ))
 }
 
 #[cfg(not(windows))]
-fn run_script(_: &Path, _: bool, _: Provider) -> Result<(), String> {
+fn run_script(_: &Path, _: bool, _: Provider, _: SubagentMode) -> Result<(), String> {
     Err("E_UNSUPPORTED_OS".into())
 }
 
@@ -422,10 +457,56 @@ fn emit(
     );
 }
 
+/// What an install/repair run does with the optional SubagentStop hook.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SubagentMode {
+    /// Leave it exactly as it is.
+    Keep,
+    /// Make sure it is registered (only meaningful for providers that document the event).
+    On,
+    /// Only manage the SubagentStop hook (used when toggling sub-agent notifications).
+    OnlySet(bool),
+}
+
+impl SubagentMode {
+    fn args(self, install: bool) -> Vec<&'static str> {
+        if !install {
+            return Vec::new(); // uninstall always removes our SubagentStop hook itself
+        }
+        match self {
+            Self::Keep => Vec::new(),
+            Self::On => vec!["-Subagent", "on"],
+            Self::OnlySet(true) => vec!["-Subagent", "on", "-SubagentOnly"],
+            Self::OnlySet(false) => vec!["-Subagent", "off", "-SubagentOnly"],
+        }
+    }
+}
+
+/// Registers or removes the SubagentStop hook for connected providers that support it. Antigravity is never
+/// touched. Idempotent; backups are made by the script before any edit.
+pub fn sync_subagent_hooks(scripts_dir: &Path, enabled: bool) -> Result<(), String> {
+    write_scripts(scripts_dir)?;
+    for provider in ALL {
+        if provider == Provider::Antigravity {
+            continue;
+        }
+        let state = detect_one(provider)?.state;
+        // Only providers that are already connected: never install a Stop hook as a side effect.
+        if matches!(
+            state,
+            ProviderState::Connected | ProviderState::RepairRequired
+        ) {
+            run_script(scripts_dir, true, provider, SubagentMode::OnlySet(enabled))?;
+        }
+    }
+    Ok(())
+}
+
 pub fn run_operation(
     app: &AppHandle,
     scripts_dir: &Path,
     install: bool,
+    subagent_on: bool,
 ) -> Result<Vec<ProviderReport>, String> {
     let operation = if install { "install" } else { "uninstall" };
     write_scripts(scripts_dir)?;
@@ -471,7 +552,12 @@ pub fn run_operation(
                 "uninstalling"
             },
         );
-        let outcome = run_script(scripts_dir, install, provider);
+        let mode = if subagent_on && provider != Provider::Antigravity {
+            SubagentMode::On
+        } else {
+            SubagentMode::Keep
+        };
+        let outcome = run_script(scripts_dir, install, provider, mode);
         // Always verify against the files, never trust the script exit code alone.
         let after = detect_one(provider)?;
         let verified = if install {
@@ -641,5 +727,110 @@ mod tests {
             assert!(BusyGuard::acquire(&flag).is_err());
         }
         assert!(BusyGuard::acquire(&flag).is_ok());
+    }
+
+    /// End-to-end through the real PowerShell scripts in a throw-away Windows profile (Turkish letters and spaces
+    /// in the path): sub-agent hooks follow the setting and capability reporting follows what is registered.
+    #[cfg(windows)]
+    #[test]
+    fn subagent_hooks_follow_the_setting_in_an_isolated_profile() {
+        use std::sync::Mutex;
+        static ENV: Mutex<()> = Mutex::new(());
+        let _lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
+        let base = std::env::temp_dir()
+            .join(format!("kn-int-{}", std::process::id()))
+            .join("Çağrı Ünal (test)");
+        let (home, local) = (base.join("home dir"), base.join("local app"));
+        let _ = fs::remove_dir_all(&base);
+        for dir in [".claude", ".codex", ".gemini/config"] {
+            fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        fs::create_dir_all(&local).unwrap();
+        fs::write(home.join(".claude/settings.json"), r#"{"theme":"dark"}"#).unwrap();
+        fs::write(
+            home.join(".codex/config.toml"),
+            "notify = [\"keep\", \"me\"]
+",
+        )
+        .unwrap();
+        let (old_home, old_local) = (
+            std::env::var_os("USERPROFILE"),
+            std::env::var_os("LOCALAPPDATA"),
+        );
+        std::env::set_var("USERPROFILE", &home);
+        std::env::set_var("LOCALAPPDATA", &local);
+        let scripts = base.join("scripts");
+        write_scripts(&scripts).unwrap();
+
+        // nothing connected yet: sync is a no-op and installs nothing as a side effect
+        sync_subagent_hooks(&scripts, true).unwrap();
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().state,
+            ProviderState::Available
+        );
+        assert!(!home.join(".codex/hooks.json").exists());
+
+        run_script(&scripts, true, Provider::Claude, SubagentMode::Keep).unwrap();
+        run_script(&scripts, true, Provider::Codex, SubagentMode::Keep).unwrap();
+        let reports = detect_all().unwrap();
+        assert!(reports
+            .iter()
+            .filter(|r| r.id != "antigravity")
+            .all(|r| r.state == ProviderState::Connected));
+        assert!(reports
+            .iter()
+            .filter(|r| r.id != "antigravity")
+            .all(|r| r.subagent == "hook_missing"));
+
+        sync_subagent_hooks(&scripts, true).unwrap();
+        let reports = detect_all().unwrap();
+        for r in &reports {
+            let expected = if r.id == "antigravity" {
+                "unsupported"
+            } else {
+                "ready"
+            };
+            assert_eq!(r.subagent, expected, "{}", r.id);
+        }
+        sync_subagent_hooks(&scripts, true).unwrap(); // idempotent
+        assert_eq!(detect_one(Provider::Claude).unwrap().subagent, "ready");
+
+        sync_subagent_hooks(&scripts, false).unwrap();
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().subagent,
+            "hook_missing"
+        );
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().state,
+            ProviderState::Connected,
+            "Stop hook stays"
+        );
+        assert_eq!(
+            fs::read_to_string(home.join(".codex/config.toml")).unwrap(),
+            "notify = [\"keep\", \"me\"]
+"
+        );
+
+        run_script(&scripts, true, Provider::Claude, SubagentMode::On).unwrap(); // Repair with the setting on
+        assert_eq!(detect_one(Provider::Claude).unwrap().subagent, "ready");
+        run_script(&scripts, false, Provider::Claude, SubagentMode::Keep).unwrap(); // Uninstall removes both
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().state,
+            ProviderState::Available
+        );
+        assert_eq!(
+            detect_one(Provider::Claude).unwrap().subagent,
+            "hook_missing"
+        );
+
+        match old_home {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+        match old_local {
+            Some(v) => std::env::set_var("LOCALAPPDATA", v),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        let _ = fs::remove_dir_all(base.parent().unwrap());
     }
 }

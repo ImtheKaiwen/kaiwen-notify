@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased (proposed: 0.6.0)
+
+### Added
+- **Per-provider sounds**: Claude Code, Codex and Antigravity each have their own notification settings: enable switch, volume, task sound and sub-agent sound, with preview, change and reset-to-default. Custom sounds can be WAV, MP3 or Ogg Vorbis (up to 10 MB / 30 s) and are copied into the app's private data folder, so moving or deleting the original never breaks anything. A bundled softer sub-agent chime is the default for sub-agent sounds.
+- **Sub-agent notifications** (off by default, one global switch): Claude Code `SubagentStop` and Codex `SubagentStop` play the sub-agent sound. The hook is registered only while the switch is on (it costs a process per finished sub-agent), by Install/Repair or by the switch itself, and only our own handler is ever added or removed. Claude's internal helper agents (empty `agent_type`) and any `Stop` that carries an agent id are never announced. Antigravity documents no sub-agent finished event, so it only has the main sound and the UI says why.
+- **Central event classification** (`events.rs`): provider-independent `main_complete` / `subagent_complete` / `unknown`; the UI and playback never read raw provider fields. Ambiguous events are `unknown` and silent.
+- **Notification gate** (`gate.rs`): identity-based duplicate filtering, merging of simultaneous sub-agent completions, main-task priority and a 150 ms grace so a main completion replaces a just-queued sub-agent sound.
+- Capability reporting per provider (`unsupported` / `hook_missing` / `ready`) and "verified" evidence once a real sub-agent event has arrived.
+- `docs/NOTIFICATIONS.md`, new tests for sounds, classification, gate, hook install/uninstall and privacy.
+
+### Changed
+- The hook bridge now forwards a short whitelist of event metadata (hook name, session/turn/agent ids, agent type) instead of a bare "completed" ping. It still never sends prompts, replies or paths, and older app/bridge combinations keep working.
+- Audio: decode on demand (Symphonia, MP3/Ogg/WAV only) and play through WinMM from memory with volume applied; no resident audio thread or cached samples.
+- Existing users: the single shared sound becomes the task sound of every provider on first start; the old field stays in `settings.json` (downgrade safe).
+- Antigravity hook command, Claude Code and Codex `Stop` commands, and Codex's `notify` setting are unchanged.
+
 ## 0.5.1
 
 ### Fixed

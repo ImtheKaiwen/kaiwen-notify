@@ -1,4 +1,4 @@
-"""Generates the bundled default notification sound (an original two-note chime).
+"""Generates the bundled default notification sounds (original synthesized chimes: main task and sub-agent).
 
 Deterministic and fully synthesized here, so it carries no third-party audio rights.
 Run: python scripts/make-default-sound.py
@@ -21,16 +21,27 @@ def note(freq, start, length, gain):
         yield int(start * RATE) + n, gain * env * tone
 
 
-samples = [0.0] * int(0.7 * RATE)
-for freq, start, gain in ((880.0, 0.0, 0.5), (1318.5, 0.14, 0.45)):  # A5 then E6
-    for index, value in note(freq, start, 0.55, gain):
-        if index < len(samples):
-            samples[index] += value
-peak = max(abs(s) for s in samples)
-scale = 0.8 / peak
-with wave.open(str(OUT), 'wb') as wav:
-    wav.setnchannels(1)
-    wav.setsampwidth(2)
-    wav.setframerate(RATE)
-    wav.writeframes(b''.join(struct.pack('<h', int(s * scale * 32767)) for s in samples))
-print('wrote', OUT, f'{len(samples) / RATE:.2f}s')
+def render(notes, length):
+    samples = [0.0] * int(length * RATE)
+    for freq, start, gain, dur in notes:
+        for index, value in note(freq, start, dur, gain):
+            if index < len(samples):
+                samples[index] += value
+    peak = max(abs(s) for s in samples)
+    scale = 0.8 / peak
+    return b''.join(struct.pack('<h', int(s * scale * 32767)) for s in samples)
+
+
+def write(path, frames, seconds):
+    with wave.open(str(path), 'wb') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(RATE)
+        wav.writeframes(frames)
+    print('wrote', path, f'{seconds:.2f}s')
+
+
+# main task: two-note chime (A5 then E6)
+write(OUT, render(((880.0, 0.0, 0.5, 0.55), (1318.5, 0.14, 0.45, 0.55)), 0.7), 0.7)
+# sub-agent: a single short, softer note so the two are easy to tell apart
+write(OUT.with_name('subagent.wav'), render(((1046.5, 0.0, 0.5, 0.3),), 0.38), 0.38)

@@ -17,13 +17,17 @@ owner objects or publishes brand rules that this use does not meet, remove the f
 back to a letter mark automatically. The origin and exact license terms of these files were not
 documented when they were added; the maintainer should confirm them.
 
-## Default notification sound (`src-tauri/resources/default.wav`)
+## Default notification sounds (`src-tauri/resources/default.wav`, `subagent.wav`)
 
-Synthesized by `scripts/make-default-sound.py` from sine waves. It is original to this project and
-released under the MIT license. Earlier releases (0.4.x) bundled a different default sound whose
-origin was not documented; it was replaced for that reason.
+Synthesized by `scripts/make-default-sound.py` from sine waves: a two-note chime for finished tasks and a single
+softer note for finished sub-agents. Both are original to this project and released under the MIT license. Earlier
+releases (0.4.x) bundled a different default sound whose origin was undocumented; it was replaced for that reason.
 
-A custom WAV you choose in the app stays on your computer and is never part of a release.
+Test audio (`src-tauri/test-fixtures/tone.wav|mp3|ogg`) are 0.3 s sine tones generated for the unit tests; they are
+not part of the installer.
+
+Custom sounds you choose in the app are copied into the app's private data folder on your computer; they are never
+part of a release and are not uploaded anywhere.
 
 ## Application icon
 
@@ -31,6 +35,6 @@ A custom WAV you choose in the app stays on your computer and is never part of a
 
 ## Software dependencies
 
-Rust crates and npm packages keep their own licenses (mostly MIT/Apache-2.0); see `Cargo.lock` and
+Audio decoding uses Symphonia (MPL-2.0; MP3, Ogg Vorbis and WAV only). Rust crates and npm packages keep their own licenses (mostly MIT/Apache-2.0); see `Cargo.lock` and
 `package-lock.json`. Tauri is dual-licensed MIT/Apache-2.0. Microsoft Edge WebView2 is a Microsoft
 runtime installed separately under its own terms.
