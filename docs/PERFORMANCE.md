@@ -3,6 +3,39 @@
 These numbers describe one build on one computer. They are observations, not guarantees. Other machines, Windows
 builds, WebView2 versions and drivers will differ.
 
+## Per-provider sounds and sub-agent events: old vs new (unreleased branch)
+
+Single run on the machine below, 18 Nov 2026, Windows 11 build 26200, WebView2 157, release builds, measured with
+`Get-Process` (working set, cumulative CPU time) and `Get-CimInstance` for WebView2 child processes. Script:
+`perf2.ps1` flow (tray-only 30 s, window open 30 s, close window, burst of notifications, tray-only again).
+
+| State | OLD v0.5.1 (installed, attached to a long-running instance) | NEW (this branch, release build, `--autostart` start) |
+|---|---|---|
+| Tray only, idle 30 s: app process | 25.7 MB, CPU 0.016 s | 14.3 MB (fresh start), CPU 0 s |
+| Tray only after opening and closing the window | 25.8 MB, CPU 0 s | 27.4 MB, CPU 0 s |
+| WebView2 processes in tray-only mode | 0 | 0 |
+| Window open, idle 30 s: app + 6 WebView2 processes | 26.0 + 344.5 = 370.5 MB, CPU 0 s | 27.1 + 344.4 = 371.5 MB, CPU 0 s |
+| While notifications play (peak app working set) | 25.8 MB; CPU 0 s over 4 s (3 sounds) | 30.0 MB; CPU 0.125 s over 8 s (6 sounds, about 20 ms CPU each) |
+| Tray only, 5 s after the burst | 25.8 MB | 29.8 MB |
+| Executable size | 13.97 MB | 15.46 MB (+1.5 MB: Symphonia MP3/Ogg/WAV decoders) |
+
+Reading it honestly:
+
+- The OLD numbers come from the instance that was already running for a while, the NEW "fresh start" number from a cold
+  `--autostart` launch, so those two cells are not comparable (a cold tray-only start was about 14 MB in v0.5.0 too).
+  The like-for-like cells are the ones after a window open/close cycle: **about +1.6 MB** tray-only (27.4 vs 25.8 MB)
+  and **about +1 MB** with the window open. The 5-second-after-burst value (29.8 MB) shows allocator retention of
+  roughly 2 to 3 MB after playing; it did not keep growing across the 6 sounds.
+- During a notification the NEW build decodes the sound, applies the volume and plays it from memory on a short-lived
+  thread, so it spends about 20 ms of CPU per sound and holds the decoded samples only while it plays (peak +2.6 MB
+  over idle for a 0.7 s mono 24 kHz chime; a long custom file would use more, bounded by the 30 s / 10 MB limits). The
+  old build handed a file path to WinMM and measured no CPU at all.
+- Idle CPU stays at 0 in every idle window; no timers or polling were added (the only new sleep is the 150 ms
+  sub-agent grace delay, per sub-agent event).
+- No WebView2 process exists in tray-only mode, before or after this change.
+- Not measured: a long soak test (hours) for leaks. The gate's memory is bounded by pruning (unit test), and the app
+  did not grow across the burst above, but that is not a soak test.
+
 ## Method
 
 | Item | Value |

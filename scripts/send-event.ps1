@@ -1,5 +1,7 @@
 # Kaiwen Notify: universal, best-effort hook adapter (PowerShell 5.1+)
 # The hook is intentionally silent on failures and does not modify agent decisions.
+# It forwards only a short whitelist of event metadata (hook name, session/turn/agent ids, agent type) to the app;
+# the app classifies the event. Prompts, replies, file paths and transcripts are never read into the message.
 param(
     [Parameter(Mandatory = $true)]
     [ValidateSet('claude', 'codex', 'antigravity')]
@@ -37,6 +39,26 @@ function Send-Udp([string]$Message) {
     finally { $udp.Dispose() }
 }
 
+# Trims, strips control characters and caps the length of an id-like value; $null when nothing is left.
+function Get-Short($Value) {
+    if ($null -eq $Value) { return $null }
+    $text = ([string]$Value) -replace '[\x00-\x1f\x7f]', ''
+    $text = $text.Trim()
+    if ($text.Length -gt 100) { $text = $text.Substring(0, 100) }
+    if ($text -eq '') { return $null }
+    return $text
+}
+
+# Builds the compact JSON datagram. Absent values are omitted, so a bare event is exactly
+# {"source":"claude","kind":"completed"}, which older app versions understand too.
+function New-Message([string]$Kind, $Extra) {
+    $message = [ordered]@{ source = $Source; kind = $Kind }
+    foreach ($key in @('note', 'product', 'hook', 'session', 'turn', 'agent', 'agent_type')) {
+        if ($null -ne $Extra -and $Extra.Contains($key) -and $null -ne $Extra[$key]) { $message[$key] = $Extra[$key] }
+    }
+    return ($message | ConvertTo-Json -Compress)
+}
+
 # Antigravity ships as three runtimes that share one hooks.json but keep separate data folders.
 # The Stop payload's transcriptPath reveals which one is calling: ~/.gemini/antigravity (Desktop App),
 # antigravity-ide (IDE) or antigravity-cli (CLI). Only the product name is reported, never the path.
@@ -50,21 +72,33 @@ function Get-AntigravityProduct($Payload) {
 
 Write-Diag 'invoked'
 try {
-    $product = $null
-    # Claude, Codex Stop hooks and Antigravity supply JSON via stdin.
+    $extra = [ordered]@{}
+    # Claude, Codex Stop/SubagentStop hooks and Antigravity supply JSON via stdin.
     # Codex requires valid JSON on stdout, even when the app is unavailable.
     if ([Console]::IsInputRedirected) {
         $raw = [Console]::In.ReadToEnd()
         if (-not [string]::IsNullOrWhiteSpace($raw)) {
             $payload = try { $raw | ConvertFrom-Json } catch { Write-Diag 'payload not JSON'; $null }
-            if ($Source -eq 'antigravity') { $product = Get-AntigravityProduct $payload }
-            Write-Diag ("payload product=$product fullyIdle=$($payload.fullyIdle) reason=$($payload.terminationReason) exec=$($payload.executionNum) bytes=$($raw.Length) keys=$(@($payload.PSObject.Properties.Name) -join ',')")
             if ($Source -eq 'antigravity') {
-                $suffix = if ($product) { ',"product":"' + $product + '"' } else { '' }
+                $extra['product'] = Get-AntigravityProduct $payload
+                $extra['session'] = Get-Short $payload.conversationId
+                $extra['turn'] = Get-Short $payload.executionNum
+            }
+            else {
+                $extra['hook'] = Get-Short $payload.hook_event_name
+                $extra['session'] = Get-Short $payload.session_id
+                # Claude: prompt_id identifies the user prompt; Codex: turn_id identifies the turn.
+                $extra['turn'] = if ($payload.turn_id) { Get-Short $payload.turn_id } else { Get-Short $payload.prompt_id }
+                $extra['agent'] = Get-Short $payload.agent_id
+                $extra['agent_type'] = Get-Short $payload.agent_type
+            }
+            Write-Diag ("payload hook=$($extra['hook']) product=$($extra['product']) fullyIdle=$($payload.fullyIdle) reason=$($payload.terminationReason) exec=$($payload.executionNum) agent_type=$($extra['agent_type']) bytes=$($raw.Length) keys=$(@($payload.PSObject.Properties.Name) -join ',')")
+            if ($Source -eq 'antigravity') {
                 # Per the Stop contract fullyIdle=false means background tasks are still running.
                 if ($payload.fullyIdle -eq $false) {
                     Write-Diag 'skip: fullyIdle=false'
-                    Send-Udp ('{"source":"antigravity","kind":"seen","note":"not_idle"' + $suffix + '}')
+                    $extra['note'] = 'not_idle'
+                    Send-Udp (New-Message 'seen' $extra)
                     return
                 }
                 # Documented reasons are examples, not an exhaustive list, so skip only known non-completions
@@ -72,7 +106,8 @@ try {
                 $reason = [string]$payload.terminationReason
                 if ($reason -in 'error', 'max_steps_exceeded', 'cancelled', 'canceled', 'user_cancelled') {
                     Write-Diag "skip: reason=$reason"
-                    Send-Udp ('{"source":"antigravity","kind":"seen","note":"stopped_early"' + $suffix + '}')
+                    $extra['note'] = 'stopped_early'
+                    Send-Udp (New-Message 'seen' $extra)
                     return
                 }
             }
@@ -83,12 +118,7 @@ try {
     else { Write-Diag 'stdin not redirected' }
 
     Write-Diag 'sending'
-    if ($Source -eq 'antigravity' -and $product) {
-        Send-Udp ('{"source":"antigravity","kind":"completed","product":"' + $product + '"}')
-    }
-    else {
-        Send-Udp ('{"source":"' + $Source + '","kind":"completed"}')
-    }
+    Send-Udp (New-Message 'completed' $extra)
 }
 catch {
     # Never fail an agent turn because the notification app is closed.

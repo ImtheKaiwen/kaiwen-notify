@@ -8,7 +8,8 @@ Works with **Claude Code**, **Codex** (CLI and Desktop) and **Antigravity**. Bui
 
 ## Features
 
-- Sound notification when an agent turn completes (original bundled chime, or your own WAV).
+- Sound notification when an agent turn completes. **Each tool has its own settings**: on/off, volume, a task sound and a sub-agent sound, each with preview and reset to default. Custom sounds can be WAV, MP3 or OGG.
+- **Sub-agent notifications** (off by default) for Claude Code and Codex: a separate, softer sound when a sub-agent finishes. Antigravity has no documented sub-agent event, so it only gets the task sound (the UI says so).
 - One-click setup: **Install integrations** (TR: *Entegrasyonları Kur*) installs hooks per tool and shows real per-provider progress.
 - Safe removal: **Remove integrations** (*Entegrasyonları Kaldır*) deletes only Kaiwen Notify's own hooks and backs up every file it edits. **Install missing / Repair** (*Eksikleri kur / Onar*) fixes a partial or outdated setup.
 - **English / Türkçe** UI. Follows the Windows display language by default, can be switched in Settings instantly, and the choice is remembered.
@@ -45,7 +46,8 @@ Download `Kaiwen Notify_<version>_x64-setup.exe` from the [Releases](https://git
 
 ## Everyday use
 
-- **Change the sound:** Settings, *Notification sound*, **Change**, pick a `.wav` (PCM, under 10 MB). **Test notification** plays it; **Use default** restores the bundled chime. Your custom file stays on your computer.
+- **Sounds per tool:** Settings page, *Sounds* section: one card per tool with an on/off switch, a volume slider and two rows (*Task sound*, *Sub-agent sound*) with **Preview**, **Change** and **Use default**. Pick a `.wav`, `.mp3` or `.ogg` (up to 10 MB / 30 s). The file is copied into the app's own data folder, so moving or deleting the original does not matter. Upgrading keeps your old custom sound as the task sound of every tool.
+- **Sub-agent sounds:** turn on *Sub-agent notifications* in Settings (this registers a `SubagentStop` hook for connected Claude Code and Codex installs; turning it off removes only Kaiwen Notify's own handler). Codex asks you to trust the new hook. The card of each tool shows when a real sub-agent event has been seen. Details and the exact rules: [docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
 - **Language / theme:** Settings. Both apply immediately.
 - **Launch at startup:** Settings. The toggle shows the real Windows registration state. Uninstalling removes the entry.
 - **Remove integrations:** press **Remove integrations** and confirm. Backups stay next to the edited files (`*.kaiwen-backup-*`). Do this before uninstalling the app, because removing the app from Windows Settings does not revert hook files.
@@ -64,7 +66,7 @@ Until a signed release is published (see [docs/RELEASING.md](docs/RELEASING.md))
 
 ## How it works
 
-Agent hook, then a tiny PowerShell bridge (`%LOCALAPPDATA%\KaiwenNotify\hooks\send-event.ps1`), then a one-way UDP datagram to `127.0.0.1:47451`, then the Rust listener plays the WAV through WinMM. Duplicate events from the same source within 650 ms are ignored. Antigravity events are skipped while `fullyIdle` is false or when the stop reason is an error or step-limit stop.
+Agent hook, then a tiny PowerShell bridge (`%LOCALAPPDATA%\KaiwenNotify\hooks\send-event.ps1`), then a one-way UDP datagram to `127.0.0.1:47451`, then the Rust listener classifies the event (main task, sub-agent or unknown), applies the duplicate/merge/priority rules and plays that tool's sound through WinMM (decoded on demand, nothing kept in memory). Duplicate deliveries are ignored, simultaneous sub-agents merge into one sound and a main completion always wins. Antigravity events are skipped while `fullyIdle` is false or when the stop reason is an error or step-limit stop.
 
 Diagnostics: create an empty file `%LOCALAPPDATA%\KaiwenNotify\diag.enabled` and each hook call appends metadata (no prompts or paths) to `diag.log` in the same folder. Delete the file to turn it off.
 
@@ -82,6 +84,8 @@ Short version (details, method and caveats in [docs/PERFORMANCE.md](docs/PERFORM
 | Window open | about 395 MB combined: app 30 MB plus 6 WebView2 processes (~365 MB) |
 | First window (splash) after launch | about 0.5 to 0.7 s; the main window follows after the ~2.4 s splash |
 | Idle CPU | 0 to 0.06 s over 30 s windows |
+
+The per-provider sounds change (unreleased) was measured separately against v0.5.1 on the same laptop: about +1.6 MB tray-only and about +1 MB with the window open, about 20 ms of CPU per played sound, +2.6 MB peak while a short chime plays, executable +1.5 MB (audio decoders), idle CPU still 0, still no WebView2 process in tray-only mode. Single run; table and caveats in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#per-provider-sounds-and-sub-agent-events-old-vs-new-unreleased-branch).
 
 These are measurements from one laptop (Windows 11 build 26200, Core i5-12450H, 16 GB), taken with `Get-Process` on an installed release build, not guarantees. The window-open number includes Microsoft's WebView2 processes, which are shared-runtime processes that Windows reports as separate working sets.
 
@@ -115,7 +119,7 @@ See [docs/SECURITY.md](docs/SECURITY.md). In short:
 - The UDP listener only binds `127.0.0.1` but has no sender authentication; a local process can trigger the sound. Nothing privileged is reachable through it.
 - Hook commands run with `-ExecutionPolicy Bypass` for the app's own bundled script.
 - Windows 10/11 x64 only. Notifications mean "agent turn ended", not "task succeeded".
-- Antigravity real-task notification has not been confirmed end to end yet.
+- Antigravity Desktop App notifications were verified on a real task; IDE and CLI real tasks are not verified. Codex sub-agent notifications follow the documented `SubagentStop` hook but are **not yet verified with a real Codex sub-agent run**.
 - Tested on one machine plus CI; other PCs are covered by isolated-profile tests only (see [docs/PERFORMANCE.md](docs/PERFORMANCE.md#compatibility-matrix)).
 
 ## License

@@ -11,8 +11,12 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+mod audio;
+mod events;
+mod gate;
 mod i18n;
 mod integrations;
+mod sound_config;
 mod updater;
 
 use tauri::{
@@ -22,10 +26,25 @@ use tauri::{
 };
 use tauri_plugin_autostart::ManagerExt as _;
 
+use events::{Category, Classified, Provider, RawEvent, Runtime};
+use sound_config::SoundKind;
+
 const PORT: u16 = 47451;
+
+/// Listener port. `KAIWEN_NOTIFY_PORT` (4-5 digits) exists only so tests and side-by-side builds can run next to
+/// a live instance; the hook bridge honours the same variable.
+fn listener_port() -> u16 {
+    std::env::var("KAIWEN_NOTIFY_PORT")
+        .ok()
+        .filter(|v| (4..=5).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|p| *p >= 1024)
+        .unwrap_or(PORT)
+}
 const SKIP_SPLASH_MARKER: &str = "skip-splash";
 const SPLASH_FAILSAFE: Duration = Duration::from_secs(6);
-const DEFAULT_WAV: &[u8] = include_bytes!("../resources/default.wav");
+const DEFAULT_MAIN_WAV: &[u8] = include_bytes!("../resources/default.wav");
+const DEFAULT_SUBAGENT_WAV: &[u8] = include_bytes!("../resources/subagent.wav");
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -45,6 +64,14 @@ struct Settings {
     language: String,
     /// Per Antigravity runtime (`app`, `ide`, `cli`): proof the hook really ran.
     antigravity: HashMap<String, ProductSeen>,
+    /// Independent sound settings per provider (volume, on/off, main and sub-agent sound).
+    providers: sound_config::ProviderSounds,
+    /// Global switch for sub-agent notifications (off by default; it also installs/removes the SubagentStop hooks).
+    subagent_notifications: bool,
+    /// Schema marker for the one-time migration from the single shared sound.
+    sounds_version: u32,
+    /// Unix millis of the last real sub-agent event per provider: proof the SubagentStop hook ran.
+    subagent_seen: HashMap<String, u64>,
 }
 fn yes() -> bool {
     true
@@ -63,6 +90,10 @@ impl Settings {
             last_update_check: 0,
             language: system_theme(),
             antigravity: HashMap::new(),
+            providers: sound_config::ProviderSounds::default(),
+            subagent_notifications: false,
+            sounds_version: 0,
+            subagent_seen: HashMap::new(),
         }
     }
 }
@@ -71,61 +102,18 @@ impl Settings {
 struct NotificationEvent {
     source: String,
     timestamp: u64,
+    category: Category,
 }
 
 #[derive(Serialize)]
 struct Status {
     settings: Settings,
+    /// Custom sounds whose private copy has disappeared (`<provider>.<kind>`); the default plays instead.
+    missing_sounds: Vec<String>,
     system_language: &'static str,
     received: u64,
     listener_ok: bool,
     last_event: Option<NotificationEvent>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)]
-struct HookEvent {
-    source: Source,
-    kind: Kind,
-    /// Antigravity only: which runtime called the hook (App/IDE/CLI share one hooks.json).
-    #[serde(default)]
-    product: Option<Product>,
-    /// Antigravity `seen` events: why no sound was played.
-    #[serde(default)]
-    note: Option<Note>,
-}
-
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "lowercase")]
-enum Product {
-    App,
-    Ide,
-    Cli,
-}
-impl Product {
-    fn key(self) -> &'static str {
-        match self {
-            Self::App => "app",
-            Self::Ide => "ide",
-            Self::Cli => "cli",
-        }
-    }
-}
-
-#[derive(Deserialize, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-enum Note {
-    NotIdle,
-    StoppedEarly,
-}
-impl Note {
-    fn key(self) -> &'static str {
-        match self {
-            Self::NotIdle => "not_idle",
-            Self::StoppedEarly => "stopped_early",
-        }
-    }
 }
 
 /// Evidence that a real Antigravity runtime executed our hook (file presence alone proves nothing).
@@ -140,37 +128,15 @@ struct ProductSeen {
     last_note: Option<String>,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Source {
-    Claude,
-    Codex,
-    Antigravity,
-}
-impl Source {
-    fn label(&self) -> &'static str {
-        match self {
-            Self::Claude => "Claude Code",
-            Self::Codex => "Codex CLI",
-            Self::Antigravity => "Antigravity",
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Kind {
-    Completed,
-    Seen,
-}
-
 struct AppState {
     settings: Mutex<Settings>,
     received: AtomicU64,
     listener_ok: AtomicBool,
     last_event: Mutex<Option<NotificationEvent>>,
     config_path: PathBuf,
-    default_sound: PathBuf,
+    /// Private copies of user-chosen sounds (see sound_config).
+    sounds_dir: PathBuf,
+    gate: Mutex<gate::Gate>,
     setup_scripts_dir: PathBuf,
     integration_busy: AtomicBool,
     startup: Mutex<Startup>,
@@ -219,7 +185,11 @@ async fn run_integration_op(
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let _guard = integrations::BusyGuard::acquire(&state.integration_busy)?;
-        integrations::run_operation(&app, &scripts_dir, install)
+        let subagent_on = state
+            .settings
+            .lock()
+            .is_ok_and(|settings| settings.subagent_notifications);
+        integrations::run_operation(&app, &scripts_dir, install, subagent_on)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -360,65 +330,217 @@ fn now_millis() -> u64 {
 }
 
 fn save_settings(state: &AppState, settings: &Settings) -> Result<(), String> {
+    write_settings_file(&state.config_path, settings)
+}
+
+fn write_settings_file(path: &Path, settings: &Settings) -> Result<(), String> {
     let serialized = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
     // Atomic: temp file + rename, so a crash never leaves half-written settings.
-    let tmp = state.config_path.with_extension("json.tmp");
+    let tmp = path.with_extension("json.tmp");
     fs::write(&tmp, serialized)
-        .and_then(|_| fs::rename(&tmp, &state.config_path))
+        .and_then(|_| fs::rename(&tmp, path))
         .map_err(|e| format!("E_SAVE_SETTINGS:{e}"))
 }
 
-fn current_sound(state: &AppState) -> Result<PathBuf, String> {
-    let settings = state.settings.lock().map_err(|e| e.to_string())?;
-    Ok(if settings.sound_path.is_empty() {
-        state.default_sound.clone()
-    } else {
-        PathBuf::from(&settings.sound_path)
+fn default_wav(kind: SoundKind) -> &'static [u8] {
+    match kind {
+        SoundKind::Main => DEFAULT_MAIN_WAV,
+        SoundKind::Subagent => DEFAULT_SUBAGENT_WAV,
+    }
+}
+
+/// A sound ready to play: decoded on demand, volume applied, nothing kept afterwards.
+struct Prepared {
+    wav: Vec<u8>,
+    length: Duration,
+    /// The chosen custom file could not be used, so the bundled sound stands in.
+    fell_back: bool,
+}
+
+fn prepare(state: &AppState, provider: Provider, kind: SoundKind) -> Result<Prepared, String> {
+    let (choice, volume) = {
+        let settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let config = settings.providers.get(provider);
+        (config.choice(kind).clone(), config.volume)
+    };
+    let source = match sound_config::resolve(&state.sounds_dir, &choice) {
+        Some(path) => audio::Source::File(path),
+        None => audio::Source::Default,
+    };
+    let (pcm, fell_back) = audio::load(&source, default_wav(kind));
+    let pcm = pcm?;
+    Ok(Prepared {
+        wav: audio::to_wav(&pcm, audio::gain_from_volume(volume)),
+        length: Duration::from_secs_f32(pcm.seconds()),
+        fell_back,
     })
 }
 
-#[cfg(windows)]
-fn play_wav(path: &Path) -> Result<(), String> {
-    use std::{ffi::c_void, os::windows::ffi::OsStrExt};
-    #[link(name = "winmm")]
-    unsafe extern "system" {
-        fn PlaySoundW(sound: *const u16, hmod: *mut c_void, flags: u32) -> i32;
+/// Playback happens on a short-lived thread that ends with the sound: no resident audio thread or buffer.
+fn spawn_playback(wav: Vec<u8>) {
+    thread::spawn(move || {
+        let _ = audio::play_wav_blocking(&wav);
+    });
+}
+
+/// Tray "Test sound": the bundled main chime at full volume (independent of any provider setting).
+fn play_default_preview() {
+    if let Ok(pcm) = audio::decode_bytes(DEFAULT_MAIN_WAV.to_vec(), "wav") {
+        spawn_playback(audio::to_wav(&pcm, 1.0));
     }
-    const SND_ASYNC: u32 = 0x0001;
-    const SND_NODEFAULT: u32 = 0x0002;
-    const SND_FILENAME: u32 = 0x0002_0000;
-    if !path.is_file() {
-        return Err("E_SOUND_MISSING".into());
+}
+
+fn parse_provider(value: &str) -> Result<Provider, String> {
+    Provider::from_key(value).ok_or_else(|| "E_INVALID_PROVIDER".to_string())
+}
+
+fn parse_kind(value: &str) -> Result<SoundKind, String> {
+    SoundKind::parse(value).ok_or_else(|| "E_INVALID_SOUND_KIND".to_string())
+}
+
+#[tauri::command]
+fn set_provider_enabled(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let provider = parse_provider(&provider)?;
+    update_settings(&state, |s| s.providers.get_mut(provider).enabled = enabled)
+}
+
+#[tauri::command]
+fn set_provider_volume(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    volume: u8,
+) -> Result<(), String> {
+    let provider = parse_provider(&provider)?;
+    update_settings(&state, |s| {
+        s.providers.get_mut(provider).volume = volume.min(100)
+    })
+}
+
+/// Validates the picked file, copies it into the app's data folder and assigns it. Runs off the UI thread
+/// because validation really decodes the file.
+#[tauri::command]
+async fn choose_sound(
+    app: tauri::AppHandle,
+    provider: String,
+    kind: String,
+    path: String,
+) -> Result<(), String> {
+    let provider = parse_provider(&provider)?;
+    let kind = parse_kind(&kind)?;
+    let dir = app.state::<AppState>().sounds_dir.clone();
+    let choice =
+        tauri::async_runtime::spawn_blocking(move || sound_config::import(Path::new(&path), &dir))
+            .await
+            .map_err(|e| e.to_string())??;
+    let state = app.state::<AppState>();
+    update_settings(&state, |s| {
+        *s.providers.get_mut(provider).choice_mut(kind) = choice
+    })?;
+    cleanup_sounds(&state);
+    Ok(())
+}
+
+#[tauri::command]
+fn reset_sound(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    kind: String,
+) -> Result<(), String> {
+    let provider = parse_provider(&provider)?;
+    let kind = parse_kind(&kind)?;
+    update_settings(&state, |s| {
+        *s.providers.get_mut(provider).choice_mut(kind) = sound_config::SoundChoice::default()
+    })?;
+    cleanup_sounds(&state);
+    Ok(())
+}
+
+fn cleanup_sounds(state: &AppState) {
+    if let Ok(settings) = state.settings.lock() {
+        sound_config::cleanup(&state.sounds_dir, &settings.providers);
     }
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // WinMM plays WAV asynchronously; no audio thread, media decoder, or child process.
-    let result = unsafe {
-        PlaySoundW(
-            wide.as_ptr(),
-            std::ptr::null_mut(),
-            SND_ASYNC | SND_NODEFAULT | SND_FILENAME,
-        )
+}
+
+/// Plays the sound exactly as a real notification would (that provider's file and volume), ignoring the
+/// enable switches. Returns true when the chosen file was unusable and the bundled sound was played instead.
+#[tauri::command]
+fn preview_sound(
+    state: tauri::State<'_, AppState>,
+    provider: String,
+    kind: String,
+) -> Result<bool, String> {
+    let prepared = prepare(&state, parse_provider(&provider)?, parse_kind(&kind)?)?;
+    let fell_back = prepared.fell_back;
+    spawn_playback(prepared.wav);
+    Ok(fell_back)
+}
+
+/// Turns sub-agent notifications on or off. Enabling also registers the SubagentStop hook for the connected
+/// providers that document one (Claude Code, Codex); disabling removes only our own handler again.
+#[tauri::command]
+async fn set_subagent_notifications(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<Vec<integrations::ProviderReport>, String> {
+    let dir = app.state::<AppState>().setup_scripts_dir.clone();
+    let previous = {
+        let state = app.state::<AppState>();
+        let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
+        let previous = settings.subagent_notifications;
+        settings.subagent_notifications = enabled;
+        if let Err(error) = save_settings(&state, &settings) {
+            settings.subagent_notifications = previous;
+            return Err(error);
+        }
+        previous
     };
-    if result == 0 {
-        Err("E_SOUND_PLAY".into())
-    } else {
-        Ok(())
+    let handle = app.clone();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let state = handle.state::<AppState>();
+        let _guard = integrations::BusyGuard::acquire(&state.integration_busy)?;
+        integrations::sync_subagent_hooks(&dir, enabled)?;
+        integrations::detect_all()
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    if let Err(error) = &outcome {
+        let state = app.state::<AppState>();
+        // Everything was put back: the setting returns to what it was. If undoing failed too, the hooks on disk
+        // are the truth, so the setting follows them (any handler still registered counts as on) and the UI
+        // shows the real state next to the error.
+        let wanted = if error.starts_with(integrations::E_HOOKS_INCONSISTENT) {
+            integrations::detect_all()
+                .map(|reports| reports.iter().any(|r| r.subagent == "ready"))
+                .unwrap_or(previous)
+        } else {
+            previous
+        };
+        let _ = update_settings(&state, |s| s.subagent_notifications = wanted);
     }
-}
-
-#[cfg(not(windows))]
-fn play_wav(_path: &Path) -> Result<(), String> {
-    Err("E_UNSUPPORTED_OS".into())
-}
-
-fn play_configured(state: &AppState) -> Result<(), String> {
-    play_wav(&current_sound(state)?)
+    outcome
 }
 
 #[tauri::command]
 fn get_status(state: tauri::State<'_, AppState>) -> Result<Status, String> {
+    let settings = state.settings.lock().map_err(|e| e.to_string())?.clone();
+    let mut missing_sounds = Vec::new();
+    for provider in Provider::ALL {
+        let config = settings.providers.get(provider);
+        for (kind, choice) in [("main", &config.main), ("subagent", &config.subagent)] {
+            if sound_config::resolve(&state.sounds_dir, choice).is_some_and(|path| !path.is_file())
+            {
+                missing_sounds.push(format!("{}.{kind}", provider.key()));
+            }
+        }
+    }
     Ok(Status {
-        settings: state.settings.lock().map_err(|e| e.to_string())?.clone(),
+        settings,
+        missing_sounds,
         system_language: i18n::system_language(),
         received: state.received.load(Ordering::Relaxed),
         listener_ok: state.listener_ok.load(Ordering::Relaxed),
@@ -438,37 +560,6 @@ fn set_enabled(state: tauri::State<'_, AppState>, enabled: bool) -> Result<(), S
     Ok(())
 }
 
-#[tauri::command]
-fn set_sound(state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
-    if !path.is_empty() {
-        let p = Path::new(&path);
-        if !p.is_file()
-            || !p
-                .extension()
-                .is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case("wav"))
-        {
-            return Err("E_SOUND_INVALID".into());
-        }
-        let size = fs::metadata(p).map_err(|e| e.to_string())?.len();
-        if size > 10 * 1024 * 1024 {
-            return Err("E_SOUND_TOO_LARGE".into());
-        }
-    }
-    let mut settings = state.settings.lock().map_err(|e| e.to_string())?;
-    let previous = settings.clone();
-    settings.sound_path = path;
-    if let Err(error) = save_settings(&state, &settings) {
-        *settings = previous;
-        return Err(error);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-fn test_sound(state: tauri::State<'_, AppState>) -> Result<(), String> {
-    play_configured(&state)
-}
-
 fn load_settings(path: &Path) -> Settings {
     fs::read(path)
         .ok()
@@ -478,7 +569,7 @@ fn load_settings(path: &Path) -> Settings {
 
 fn start_udp_listener(app: tauri::AppHandle) {
     // Bind synchronously so the UI never reads a "listener down" state during startup.
-    let socket = match UdpSocket::bind(("127.0.0.1", PORT)) {
+    let socket = match UdpSocket::bind(("127.0.0.1", listener_port())) {
         Ok(socket) => socket,
         Err(error) => {
             eprintln!("Cannot bind notification listener: {error}");
@@ -489,59 +580,115 @@ fn start_udp_listener(app: tauri::AppHandle) {
         .listener_ok
         .store(true, Ordering::Release);
     thread::spawn(move || {
-        let mut recent: HashMap<&'static str, Instant> = HashMap::new();
-        let mut buffer = [0u8; 1024];
+        let mut buffer = [0u8; 2048];
         loop {
             let size = match socket.recv_from(&mut buffer) {
                 Ok((size, _)) => size,
                 Err(_) => continue,
             };
-            let Ok(event) = serde_json::from_slice::<HookEvent>(&buffer[..size]) else {
+            // Anything that is not a well-formed event from one of our providers is dropped silently.
+            let Ok(raw) = serde_json::from_slice::<RawEvent>(&buffer[..size]) else {
                 continue;
             };
-            let source = event.source.label();
-            if let (Source::Antigravity, Some(product)) = (&event.source, event.product) {
-                record_antigravity(
-                    &app,
-                    product,
-                    matches!(event.kind, Kind::Completed),
-                    event.note,
-                );
+            if let Some(event) = events::classify(&raw) {
+                handle_event(&app, event);
             }
-            if matches!(event.kind, Kind::Seen) {
-                continue; // diagnostics only, never a sound
-            }
-            let now = Instant::now();
-            if recent
-                .get(source)
-                .is_some_and(|t| now.duration_since(*t) < Duration::from_millis(650))
-            {
-                continue;
-            }
-            recent.insert(source, now);
-            let state = app.state::<AppState>();
-            if !state.settings.lock().is_ok_and(|settings| settings.enabled) {
-                continue;
-            }
-            let _ = play_configured(&state);
-            state.received.fetch_add(1, Ordering::Relaxed);
-            let detail = NotificationEvent {
-                source: source.to_string(),
-                timestamp: now_millis(),
-            };
-            if let Ok(mut previous) = state.last_event.lock() {
-                *previous = Some(detail.clone());
-            }
-            let _ = app.emit("notify-event", detail);
         }
     });
 }
 
+/// The single path from "event arrived" to "sound plays": diagnostics, settings checks, duplicate/priority
+/// gate, then a short-lived playback thread. Nothing here polls or keeps audio in memory.
+fn handle_event(app: &tauri::AppHandle, event: Classified) {
+    let state = app.state::<AppState>();
+    if let (Provider::Antigravity, Some(runtime)) = (event.provider, event.runtime) {
+        if event.silent_note.is_some() || event.category == Category::MainComplete {
+            record_antigravity(app, runtime, event.silent_note.is_none(), event.silent_note);
+        }
+    }
+    if event.category == Category::SubagentComplete {
+        // Proof that the provider's SubagentStop hook really runs, whether or not the sound is enabled.
+        let now = now_millis();
+        let _ = update_settings(&state, |s| {
+            s.subagent_seen
+                .insert(event.provider.key().to_string(), now);
+        });
+        let _ = app.emit("hook-seen", event.provider.key());
+    }
+    let kind = match event.category {
+        Category::MainComplete => SoundKind::Main,
+        Category::SubagentComplete => SoundKind::Subagent,
+        Category::Unknown => return,
+    };
+    let allowed = state.settings.lock().is_ok_and(|s| {
+        s.enabled
+            && s.providers.get(event.provider).enabled
+            && (kind == SoundKind::Main || s.subagent_notifications)
+    });
+    if !allowed {
+        return;
+    }
+    let now = Instant::now();
+    let verdict = state
+        .gate
+        .lock()
+        .map(|mut gate| gate.decide(&event, now))
+        .unwrap_or(gate::Verdict::Skip("poisoned"));
+    if verdict != gate::Verdict::Play {
+        return;
+    }
+    let Ok(prepared) = prepare(&state, event.provider, kind) else {
+        return;
+    };
+    match kind {
+        SoundKind::Main => {
+            if let Ok(mut gate) = state.gate.lock() {
+                gate.main_started(event.provider, now, prepared.length);
+            }
+            spawn_playback(prepared.wav);
+            announce(app, &event);
+        }
+        SoundKind::Subagent => {
+            let handle = app.clone();
+            // Wait a moment so a main completion arriving right after can take over without a blip.
+            thread::spawn(move || {
+                thread::sleep(gate::SUBAGENT_DELAY);
+                let state = handle.state::<AppState>();
+                let wanted = state.gate.lock().is_ok_and(|mut gate| {
+                    let wanted = gate.subagent_still_wanted(event.provider, now);
+                    if wanted {
+                        gate.subagent_started(event.provider, Instant::now(), prepared.length);
+                    }
+                    wanted
+                });
+                if wanted {
+                    spawn_playback(prepared.wav);
+                    announce(&handle, &event);
+                }
+            });
+        }
+    }
+}
+
+fn announce(app: &tauri::AppHandle, event: &Classified) {
+    let state = app.state::<AppState>();
+    state.received.fetch_add(1, Ordering::Relaxed);
+    let detail = NotificationEvent {
+        source: event.provider.label().to_string(),
+        timestamp: now_millis(),
+        category: event.category,
+    };
+    if let Ok(mut previous) = state.last_event.lock() {
+        *previous = Some(detail.clone());
+    }
+    let _ = app.emit("notify-event", detail);
+}
+
 fn record_antigravity(
     app: &tauri::AppHandle,
-    product: Product,
+    product: Runtime,
     completed: bool,
-    note: Option<Note>,
+    note: Option<events::Note>,
 ) {
     let state = app.state::<AppState>();
     let now = now_millis();
@@ -754,19 +901,26 @@ pub fn run() {
             }
             let config_dir = app.path().app_config_dir()?;
             fs::create_dir_all(&config_dir)?;
-            let default_sound = config_dir.join("default.wav");
-            if !default_sound.exists() {
-                fs::write(&default_sound, DEFAULT_WAV)?;
-            }
+            let sounds_dir = config_dir.join("sounds");
             let config_path = config_dir.join("settings.json");
-            let settings = load_settings(&config_path);
+            let mut settings = load_settings(&config_path);
+            // One-time move from the single shared sound to per-provider sounds (keeps custom sounds).
+            if sound_config::migrate(
+                &settings.sound_path.clone(),
+                &mut settings.sounds_version,
+                &mut settings.providers,
+                &sounds_dir,
+            ) {
+                let _ = write_settings_file(&config_path, &settings);
+            }
             app.manage(AppState {
                 settings: Mutex::new(settings),
                 received: AtomicU64::new(0),
                 listener_ok: AtomicBool::new(false),
                 last_event: Mutex::new(None),
                 config_path,
-                default_sound,
+                sounds_dir,
+                gate: Mutex::new(gate::Gate::default()),
                 setup_scripts_dir: config_dir.join("hook-setup"),
                 integration_busy: AtomicBool::new(false),
                 startup: Mutex::new(Startup::default()),
@@ -799,7 +953,7 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id().as_ref() {
                     "show" | "update" => open_window(app),
                     "test" => {
-                        let _ = play_configured(&app.state::<AppState>());
+                        play_default_preview();
                     }
                     "quit" => app.exit(0),
                     _ => {}
@@ -849,8 +1003,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_status,
             set_enabled,
-            set_sound,
-            test_sound,
+            set_provider_enabled,
+            set_provider_volume,
+            choose_sound,
+            reset_sound,
+            preview_sound,
+            set_subagent_notifications,
             get_integrations,
             install_integrations,
             uninstall_integrations,

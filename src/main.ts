@@ -7,12 +7,14 @@ import type { Key } from './locales/en';
 
 type Theme = 'system' | 'light' | 'dark';
 type ProductSeen = { last_seen: number; last_completed: number; last_note: string | null };
-type Settings = { antigravity: Record<string, ProductSeen>; enabled: boolean; sound_path: string; theme: Theme; auto_update: boolean; last_update_check: number; language: string };
-type NotificationEvent = { source: string; timestamp: number };
-type Status = { settings: Settings; system_language: string; received: number; listener_ok: boolean; last_event: NotificationEvent | null };
+type SoundChoice = { file: string; name: string };
+type ProviderSound = { enabled: boolean; volume: number; main: SoundChoice; subagent: SoundChoice };
+type Settings = { antigravity: Record<string, ProductSeen>; providers: Record<'claude' | 'codex' | 'antigravity', ProviderSound>; subagent_notifications: boolean; subagent_seen: Record<string, number>; enabled: boolean; sound_path: string; theme: Theme; auto_update: boolean; last_update_check: number; language: string };
+type NotificationEvent = { source: string; timestamp: number; category: 'main_complete' | 'subagent_complete' | 'unknown' };
+type Status = { settings: Settings; missing_sounds: string[]; system_language: string; received: number; listener_ok: boolean; last_event: NotificationEvent | null };
 type ProviderId = 'claude' | 'codex' | 'antigravity';
 type ProviderState = 'not_installed' | 'available' | 'connected' | 'repair_required' | 'permission_required' | 'failed' | 'unsupported';
-type ProviderReport = { id: ProviderId; state: ProviderState; detail: string | null };
+type ProviderReport = { id: ProviderId; state: ProviderState; detail: string | null; subagent: 'unsupported' | 'hook_missing' | 'ready' };
 type Progress = { operation: 'install' | 'uninstall'; provider: ProviderId; phase: 'waiting' | 'working' | 'done' | 'failed' | 'skipped'; state: ProviderState; message: string };
 type UpdateMeta = { version: string; notes: string | null; date: string | null };
 type UpdateSnapshot = { configured: boolean; current_version: string; latest: UpdateMeta | null; downloaded: boolean; last_error: string | null; interval_minutes: number };
@@ -36,6 +38,7 @@ const updateBtn = el<HTMLButtonElement>('update-action');
 const enabledBox = el<HTMLInputElement>('enabled');
 const autoUpdateBox = el<HTMLInputElement>('auto-update');
 const autostartBox = el<HTMLInputElement>('autostart');
+const subagentBox = el<HTMLInputElement>('subagent-notifications');
 
 let reports: ProviderReport[] = [];
 let busy = false; // integration operation in flight
@@ -223,10 +226,6 @@ uninstallBtn.addEventListener('click', () => {
 });
 
 /* ---------- status / sound / settings ---------- */
-function presentSound(path: string) {
-  el('sound-name').textContent = path ? (path.split(/[\\/]/).pop() ?? path) : t('sound.defaultName');
-  el('sound-info').textContent = path ? t('sound.customInfo') : t('sound.defaultInfo');
-}
 /** Per-runtime proof that Antigravity really ran our hook; a hook file alone is never shown as success. */
 function renderAntigravityDiag() {
   const box = el('antigravity-diag');
@@ -254,15 +253,114 @@ function renderAntigravityDiag() {
   const hint = Object.assign(document.createElement('p'), { className: 'note', textContent: t('diag.hint') });
   box.replaceChildren(title, ...rows, hint);
 }
+/* ---------- per-provider sounds ---------- */
+type El = HTMLElement;
+function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs: Record<string, string> = {}, ...kids: (Node | string)[]): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  node.append(...kids);
+  return node;
+}
+let draggingVolume = false;
+const when = (ms: number) => new Date(ms).toLocaleString(t('time.locale'));
+
+/** Whether the sub-agent sound of a provider can be used, and the one-line reason when it cannot. Based on what is
+ *  really registered in the provider's config, never on a hard-coded list. */
+function subagentAvailability(id: ProviderId): { usable: boolean; note: string; ok: boolean } {
+  const name = t(`provider.${id}` as Key);
+  const report = reports.find((r) => r.id === id);
+  if (report?.subagent === 'unsupported') return { usable: false, ok: false, note: t('sound.subagent.unsupported', { provider: name }) };
+  if (!settings?.subagent_notifications) return { usable: false, ok: false, note: t('sound.subagent.off') };
+  if (!report || (report.state !== 'connected' && report.state !== 'repair_required')) return { usable: false, ok: false, note: t('sound.subagent.notConnected') };
+  if (report.subagent !== 'ready') return { usable: false, ok: false, note: t('sound.subagent.hookMissing') };
+  const seen = settings.subagent_seen?.[id];
+  if (seen) return { usable: true, ok: true, note: t('sound.subagent.verified', { time: when(seen) }) };
+  return { usable: true, ok: false, note: t(id === 'codex' ? 'sound.subagent.waitingCodex' : 'sound.subagent.waiting') };
+}
+
+async function previewSound(provider: ProviderId, kind: 'main' | 'subagent', button: HTMLButtonElement) {
+  button.disabled = true;
+  try {
+    const fellBack = await invoke<boolean>('preview_sound', { provider, kind });
+    if (fellBack) notify(t('sound.fallbackPlayed'), true);
+  } catch (e) { fail(e); }
+  finally { button.disabled = false; }
+}
+async function chooseSound(provider: ProviderId, kind: 'main' | 'subagent') {
+  try {
+    const path = await open({ multiple: false, directory: false, filters: [{ name: t('sound.filter'), extensions: ['wav', 'mp3', 'ogg'] }] });
+    if (!path || Array.isArray(path)) return;
+    await invoke('choose_sound', { provider, kind, path });
+    await reload();
+    notify(t('sound.saved'));
+  } catch (e) { fail(e); }
+}
+async function resetSound(provider: ProviderId, kind: 'main' | 'subagent') {
+  try { await invoke('reset_sound', { provider, kind }); await reload(); notify(t('sound.resetDone')); }
+  catch (e) { fail(e); }
+}
+
+function soundRow(id: ProviderId, kind: 'main' | 'subagent', cfg: ProviderSound, avail: { usable: boolean; note: string; ok: boolean } | null): El {
+  const choice = cfg[kind];
+  const missing = status?.missing_sounds?.includes(`${id}.${kind}`) ?? false;
+  const usable = avail ? avail.usable : true;
+  const row = h('div', { class: `srow${usable ? '' : ' off'}` });
+  const name = h('div', { class: 'name' }, choice.file ? choice.name : t(kind === 'main' ? 'sound.default.main' : 'sound.default.subagent'));
+  const sub = h('div', { class: `sub${missing ? ' warn' : ''}` }, missing ? t('sound.missing') : (avail ? avail.note : (choice.file ? t('sound.customInfo') : t('sound.builtIn'))));
+  const preview = h('button', { class: 'btn btn-sm', type: 'button', title: t('sound.preview') }, t('sound.preview'));
+  const change = h('button', { class: 'btn btn-sm', type: 'button' }, t('sound.change'));
+  const reset = h('button', { class: 'btn btn-sm btn-quiet', type: 'button' }, t('sound.reset'));
+  for (const button of [preview, change, reset]) (button as HTMLButtonElement).disabled = !usable;
+  (reset as HTMLButtonElement).disabled = !usable || !choice.file;
+  preview.addEventListener('click', () => { void previewSound(id, kind, preview as HTMLButtonElement); });
+  change.addEventListener('click', () => { void chooseSound(id, kind); });
+  reset.addEventListener('click', () => { void resetSound(id, kind); });
+  row.append(h('span', { class: 'kind' }, t(kind === 'main' ? 'sound.main' : 'sound.subagent')), h('div', { class: 'file' }, name, sub), h('div', { class: 'tools' }, preview, change, reset));
+  return row;
+}
+
+function providerSoundCard(meta: (typeof PROVIDERS)[number]): El {
+  const cfg = settings!.providers[meta.id];
+  const card = h('section', { class: `card pcard${cfg.enabled ? '' : ' disabled'}` });
+  const toggle = h('input', { type: 'checkbox', 'aria-label': t('sound.providerEnabled', { provider: t(`provider.${meta.id}` as Key) }) }) as HTMLInputElement;
+  toggle.checked = cfg.enabled;
+  toggle.addEventListener('change', async () => {
+    try { await invoke('set_provider_enabled', { provider: meta.id, enabled: toggle.checked }); } catch (e) { fail(e); }
+    await reload();
+  });
+  card.append(h('div', { class: 'pcard-head' }, providerAvatar(meta), h('span', { class: 'grow' }, t(`provider.${meta.id}` as Key)), h('span', { class: 'switch' }, toggle, h('span', { class: 'track' }))));
+
+  const range = h('input', { type: 'range', min: '0', max: '100', step: '1', 'aria-label': t('sound.volume') }) as HTMLInputElement;
+  range.value = String(cfg.volume);
+  const value = h('span', { class: 'value' }, `${cfg.volume}%`);
+  const paint = () => { range.style.setProperty('--pct', `${range.value}%`); value.textContent = `${range.value}%`; };
+  paint();
+  range.addEventListener('input', () => { draggingVolume = true; paint(); });
+  range.addEventListener('change', async () => {
+    draggingVolume = false;
+    try { await invoke('set_provider_volume', { provider: meta.id, volume: Number(range.value) }); } catch (e) { fail(e); }
+    await reload();
+  });
+  card.append(h('div', { class: 'vol' }, h('span', { class: 'label' }, t('sound.volume')), range, value));
+  card.append(soundRow(meta.id, 'main', cfg, null));
+  card.append(soundRow(meta.id, 'subagent', cfg, subagentAvailability(meta.id)));
+  return card;
+}
+
+function renderProviderSounds() {
+  if (!settings?.providers || draggingVolume) return;
+  el('provider-sounds').replaceChildren(...PROVIDERS.map(providerSoundCard));
+}
+
 function renderStatus() {
   if (!status || !settings) return;
-  presentSound(settings.sound_path);
+  renderProviderSounds();
   const active = status.listener_ok && settings.enabled;
   el('status-dot').className = `dot ${active ? 'active' : status.listener_ok ? '' : 'offline'}`;
   el('status-label').textContent = !status.listener_ok ? t('status.listenerFailed') : settings.enabled ? t('status.listening') : t('status.paused');
   el('event-count').textContent = t('status.count', { n: status.received });
   el('last-event').textContent = status.last_event
-    ? t('status.last', { source: status.last_event.source, time: new Date(status.last_event.timestamp).toLocaleTimeString(t('time.locale')) })
+    ? t(status.last_event.category === 'subagent_complete' ? 'status.lastSub' : 'status.last', { source: status.last_event.source, time: new Date(status.last_event.timestamp).toLocaleTimeString(t('time.locale')) })
     : t('status.none');
   renderAntigravityDiag();
   el('auto-update-desc').textContent = t('settings.autoUpdateDesc', { n: update?.interval_minutes ?? 10 });
@@ -272,6 +370,7 @@ function applyStatus(next: Status) {
   settings = next.settings;
   enabledBox.checked = settings.enabled;
   autoUpdateBox.checked = settings.auto_update;
+  subagentBox.checked = settings.subagent_notifications;
   applyTheme(settings.theme);
   markLanguageChoice(settings.language);
   const resolved = resolveLanguage(settings.language, next.system_language);
@@ -296,25 +395,18 @@ autostartBox.addEventListener('change', async () => {
     notify(t(autostartBox.checked ? 'toast.autostartOn' : 'toast.autostartOff'));
   } catch (e) { fail(e); autostartBox.checked = !wanted; }
 });
-el('pick-sound').addEventListener('click', async () => {
+subagentBox.addEventListener('change', async () => {
+  const wanted = subagentBox.checked;
+  subagentBox.disabled = true;
   try {
-    const path = await open({ multiple: false, directory: false, filters: [{ name: t('sound.filter'), extensions: ['wav'] }] });
-    if (!path || Array.isArray(path)) return;
-    await invoke('set_sound', { path });
-    await reload();
-    notify(t('sound.saved'));
-  } catch (e) { fail(e); }
-});
-el('reset-sound').addEventListener('click', async () => {
-  try { await invoke('set_sound', { path: '' }); await reload(); notify(t('sound.resetDone')); }
-  catch (e) { fail(e); }
-});
-const testBtn = el<HTMLButtonElement>('test-sound');
-testBtn.addEventListener('click', async () => {
-  setLoading(testBtn, true);
-  try { await invoke('test_sound'); flash(testBtn, true); }
-  catch (e) { fail(e); flash(testBtn, false); }
-  finally { setLoading(testBtn, false); }
+    // Turning it on registers the sub-agent hook for connected providers; off removes only our handler.
+    reports = await invoke<ProviderReport[]>('set_subagent_notifications', { enabled: wanted });
+    notify(t(wanted ? 'toast.subagentsOn' : 'toast.subagentsOff'));
+  } catch (e) {
+    fail(e);
+    // Show what is really installed now, including after a failed rollback.
+    try { reports = await invoke<ProviderReport[]>('get_integrations'); } catch { /* keep the last known report */ }
+  } finally { subagentBox.disabled = false; await reload(); renderProviders(); }
 });
 
 /* ---------- updates ---------- */
